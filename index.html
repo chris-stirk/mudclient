@@ -23,10 +23,16 @@ button.primary { background: var(--accent); color: #07131f; border-color: var(--
 #host { width: 200px; } #port { width: 80px; }
 main { flex: 1; display: flex; min-height: 0; }
 #term { flex: 1 1 60%; display: flex; flex-direction: column; min-width: 0; }
-#out { flex: 1; overflow-y: auto; padding: 10px 12px; font: 14px/1.35 Consolas, "Cascadia Mono", monospace; white-space: pre-wrap; word-break: break-word; }
+#splitH { flex: 0 0 6px; cursor: row-resize; background: var(--line); touch-action: none; }
+#splitH:hover, #splitH.on { background: var(--accent); }
+#out, #live { flex: 1; overflow-y: auto; padding: 10px 12px; font: 14px/1.35 Consolas, "Cascadia Mono", monospace; white-space: pre-wrap; word-break: break-word; }
+#out { min-height: 60px; }
+#live { flex: 0 0 var(--live-h, 160px); }
 #f { display: flex; padding: 8px; gap: 8px; border-top: 1px solid var(--line); background: var(--panel); }
 #cmd { flex: 1; font-family: Consolas, "Cascadia Mono", monospace; }
-#mapPane { flex: 1 1 40%; min-width: 280px; max-width: 640px; display: flex; flex-direction: column; border-left: 1px solid var(--line); background: var(--panel); }
+#mapPane { flex: 0 0 var(--map-w, 40%); min-width: 120px; display: flex; flex-direction: column; background: var(--panel); }
+#split { flex: 0 0 6px; cursor: col-resize; background: var(--line); touch-action: none; }
+#split:hover, #split.on { background: var(--accent); }
 .bar { display: flex; gap: 6px; padding: 6px 8px; align-items: center; flex-wrap: wrap; border-bottom: 1px solid var(--line); }
 .bar .grow { flex: 1; color: var(--dim); min-width: 80px; }
 #mapWrap { flex: 1; position: relative; min-height: 120px; }
@@ -34,12 +40,13 @@ main { flex: 1; display: flex; min-height: 0; }
 #sel { color: var(--text); }
 details { padding: 6px 8px; border-top: 1px solid var(--line); }
 details label { display: block; margin: 6px 0; color: var(--dim); }
-details input[type=text] { width: 100%; margin-top: 3px; }
+details input[type=text], details textarea { width: 100%; margin-top: 3px; box-sizing: border-box; font-family: monospace; }
 .sys { color: var(--dim); font-style: italic; }
 .err { color: var(--bad); }
 @media (max-width: 800px) {
   main { flex-direction: column; }
-  #mapPane { max-width: none; border-left: 0; border-top: 1px solid var(--line); flex: 0 0 45%; }
+  #mapPane { border-top: 1px solid var(--line); flex: 0 0 45%; }
+  #split { display: none; }
 }
 </style>
 </head>
@@ -53,16 +60,21 @@ details input[type=text] { width: 100%; margin-top: 3px; }
 <main>
   <section id="term">
     <div id="out" aria-live="polite"></div>
+    <div id="splitH" title="Drag to resize the live area (double-click to reset)" hidden></div>
+    <div id="live" aria-hidden="true" hidden></div>
     <form id="f" autocomplete="off">
       <input id="cmd" placeholder="Type a command (use ; to separate several)" spellcheck="false" autocapitalize="off">
       <button>Send</button>
     </form>
   </section>
+  <div id="split" title="Drag to resize (double-click to reset)"></div>
   <aside id="mapPane">
     <div class="bar">
       <button id="zDown" title="Level down">▼</button>
       <span id="zLabel">Z 0</span>
       <button id="zUp" title="Level up">▲</button>
+      <button id="zoomOut" title="Zoom out">−</button>
+      <button id="zoomIn" title="Zoom in">+</button>
       <button id="center" title="Re-centre on you and follow">Centre</button>
       <span class="grow" id="coords"></span>
     </div>
@@ -80,6 +92,15 @@ details input[type=text] { width: 100%; margin-top: 3px; }
       <label><input type="checkbox" id="nameOn"> Use first line of output as room name</label>
       <label>Failed-move pattern (regex)
         <input type="text" id="blocked" spellcheck="false">
+      </label>
+      <label>Prompt pattern (regex; each speedwalk step prints one)
+        <input type="text" id="promptRe" spellcheck="false">
+      </label>
+      <label>Speedwalk finished pattern (regex)
+        <input type="text" id="doEnd" spellcheck="false">
+      </label>
+      <label>MUD aliases to map (paste your alias list: <span id="aliasCount">0 recognised</span>)
+        <textarea id="aliases" rows="5" spellcheck="false" placeholder="home = do n,2e,se,14e&#10;alias market do 3n,2e&#10;#alias gate {n;n;e}"></textarea>
       </label>
       <div class="bar" style="border:0;padding:6px 0 0">
         <button id="export">Export</button>
@@ -109,7 +130,15 @@ function color256(n) {
   const c = i => i ? 55 + i * 40 : 0;
   return `rgb(${c(Math.floor(n / 36))},${c(Math.floor(n / 6) % 6)},${c(n % 6)})`;
 }
-const out = $("out");
+const out = $("out"), live = $("live");
+/* While scrolled up through history, a pinned copy of the newest output stays visible below. */
+const atBottom = () => out.scrollHeight - out.scrollTop - out.clientHeight < 40;
+function syncLive() {
+  const show = !atBottom();
+  $("splitH").hidden = live.hidden = !show;
+  if (show) live.scrollTop = live.scrollHeight;
+}
+out.addEventListener("scroll", syncLive);
 let sgr = {}, partialEsc = "";
 
 function applySgr(params) {
@@ -153,6 +182,8 @@ function addSpan(text, cls) {
     if (sgr.underline) s.style.textDecoration = "underline";
   }
   out.appendChild(s);
+  live.appendChild(s.cloneNode(true));
+  while (live.childNodes.length > 400) live.removeChild(live.firstChild);
 }
 function print(text, cls) {
   const stick = out.scrollHeight - out.scrollTop - out.clientHeight < 40;
@@ -173,6 +204,7 @@ function print(text, cls) {
   }
   while (out.childNodes.length > 4000) out.removeChild(out.firstChild);
   if (stick) out.scrollTop = out.scrollHeight;
+  syncLive();
 }
 const stripAnsi = t => t.replace(/\x1b\[[0-9;?]*[A-Za-z]/g, "").replace(/\r/g, "");
 
@@ -200,7 +232,7 @@ function connect() {
     if (ws !== mine) return;
     connected = false; ws = null;
     setStatus("Disconnected"); $("connect").textContent = "Connect"; $("cmd").type = "text";
-    mapper.cancelWalk(); mapper.pending.length = 0;
+    mapper.cancelWalk(); mapper.reset();
   };
 }
 $("connect").onclick = () => { if (ws) ws.close(); else connect(); };
@@ -242,13 +274,63 @@ const mapper = {
   walk: null,
   selected: null,
   view: { cx: 0, cy: 0, scale: 40, z: 0, follow: true },
-  opts: { on: true, name: false, blocked: DEFAULT_BLOCKED },
+  batch: null,
+  opts: { on: true, name: false, blocked: DEFAULT_BLOCKED, aliases: "", prompt: "HP:\\d+ EP:\\d+>", doEnd: "Do: Commands completed" },
+  aliasMap: {},
+
+  parseAliases(text) {
+    const map = {};
+    /* Drop pager noise, then fold wrapped continuation lines (indented deeper, or after a trailing comma) into their alias. */
+    const lines = text.split(/\r?\n/).filter(l => l.trim() && !/^\s*--more--/i.test(l) && !/^\s*>\s*$/.test(l));
+    const indent = l => l.match(/^\s*/)[0].replace(/\t/g, "    ").length;
+    const base = Math.min(...lines.map(indent));
+    const entries = [];
+    for (const l of lines) {
+      if (entries.length && (indent(l) > base + 3 || entries[entries.length - 1].endsWith(","))) entries[entries.length - 1] += " " + l.trim();
+      else entries.push(l.trim());
+    }
+    for (const line of entries) {
+      if (/^(\/\/|#\s)/.test(line)) continue;
+      const m = line.match(/^(?:[#\/]?alias\s+)?(\S+?)\s*(?:=>|->|=|:)\s*(.+)$/i) ||
+                line.match(/^(?:[#\/]?alias\s+)?(\S+(?:\s+\S+)+?)\s+=\s+(.+)$/i) ||
+                line.match(/^(?:[#\/]?alias\s+)?(\S+)\s+(.+)$/i);
+      if (!m) continue;
+      const body = m[2].trim().replace(/^[{"']+|[}"']+$/g, "");
+      if (body) map[m[1].toLowerCase().replace(/\s+/g, " ")] = body;
+    }
+    this.aliasMap = map;
+    return Object.keys(map).filter(k => this.expand(k, 0).some(Boolean)).length;
+  },
+  /* The steps a command would take, following aliases and 3n2e-style speedwalks: a direction for each
+     compass step, and null for any other step so that the list still lines up with the MUD's output. */
+  expand(cmd, depth) {
+    const steps = p => { const r = this.expand(p, depth + 1); return r.length ? r : [null]; };
+    const c = cmd.trim().toLowerCase().replace(/\s+/g, " ");
+    const doList = c.match(/^do\s+(.+)$/);
+    if (doList && depth <= 5) return doList[1].split(",").flatMap(steps);
+    const body = !VEC[LONG[c] || c] && depth <= 5 && (this.aliasMap[c] || this.aliasMap[c.split(" ")[0]]);
+    if (body) return body.split(";").flatMap(steps);
+    return this.expandStep(c, depth);
+  },
+  expandStep(cmd, depth) {
+    const c = cmd.trim().toLowerCase().replace(/\s+/g, " "), d = LONG[c] || c;
+    if (VEC[d]) return [d];
+    if (depth > 5 || !c) return [];
+    const marked = c.match(/^.+?\s*@(\S+)$/);
+    if (marked) return this.expandStep(marked[1], depth + 1);
+    if (/\d/.test(c) && /^(\d*(ne|nw|se|sw|n|s|e|w|u|d))+$/.test(c)) {
+      const dirs = [];
+      for (const [, n, dir] of c.matchAll(/(\d*)(ne|nw|se|sw|n|s|e|w|u|d)/g)) for (let i = +n || 1; i > 0; i--) dirs.push(dir);
+      return dirs;
+    }
+    return [];
+  },
 
   load(host, port) {
     this.key = `mudmap:${host}:${port}`;
     try { this.data = JSON.parse(store.get(this.key)) || { rooms: {}, edges: {}, cur: null }; }
     catch (e) { this.data = { rooms: {}, edges: {}, cur: null }; }
-    this.pending.length = 0; this.selected = null;
+    this.reset(); this.selected = null;
     this.view.follow = true; this.syncView(); this.render();
   },
   save() {
@@ -265,16 +347,52 @@ const mapper = {
 
   onCommand(cmd) {
     if (!this.opts.on) return;
-    const c = cmd.toLowerCase(), d = LONG[c] || c;
-    if (VEC[d]) { this.pending.push(d); if (this.pending.length > 20) this.pending.shift(); }
+    const steps = this.expand(cmd, 0), c = cmd.trim().toLowerCase();
+    if (steps.some(Boolean)) { this.pending.push({ steps, single: !!VEC[LONG[c] || c] }); if (this.pending.length > 50) this.pending.shift(); }
+  },
+  re(src, flags) { try { return src ? new RegExp(src, flags) : null; } catch (e) { return null; } },
+  reset() {
+    this.pending.length = 0;
+    if (this.batch) { clearTimeout(this.batch.timer); this.batch = null; }
   },
   onData(plain) {
-    if (!this.opts.on || !this.pending.length) return;
-    const dir = this.pending.shift();
-    let re = null;
-    try { re = new RegExp(this.opts.blocked, "i"); } catch (e) {}
-    if (re && re.test(plain)) { this.cancelWalk(); return; }
-    this.move(dir, plain);
+    if (!this.opts.on) return;
+    if (!this.batch) {
+      if (!this.pending.length) return;
+      const e = this.pending.shift();
+      if (e.single) {
+        const blocked = this.re(this.opts.blocked, "i");
+        if (blocked && blocked.test(plain)) this.cancelWalk(); else this.move(e.steps[0], plain);
+        return;
+      }
+      this.batch = { steps: e.steps, text: "", timer: null };
+    }
+    /* A speedwalk or alias answers over several chunks: collect them until it reports it has finished. */
+    const b = this.batch, end = this.re(this.opts.doEnd);
+    b.text += plain;
+    clearTimeout(b.timer);
+    if (end && end.test(b.text)) this.finishBatch();
+    else b.timer = setTimeout(() => this.finishBatch(), 2500);
+  },
+  /* Each step prints a prompt, so the text after the Nth prompt is the result of the Nth step. */
+  finishBatch() {
+    const b = this.batch;
+    if (!b) return;
+    clearTimeout(b.timer); this.batch = null;
+    const blocked = this.re(this.opts.blocked, "i"), prompt = this.re(this.opts.prompt, "g");
+    const marks = prompt ? [...b.text.matchAll(prompt)] : [];
+    const segs = marks.map((m, i) => b.text.slice(m.index + m[0].length, i + 1 < marks.length ? marks[i + 1].index : undefined));
+    if (!segs.length) {
+      if (blocked && blocked.test(b.text)) { this.cancelWalk(); return; }
+      b.steps.forEach((dir, i) => dir && this.move(dir, i === b.steps.length - 1 ? b.text : ""));
+      return;
+    }
+    let failed = false;
+    for (let i = 0; i < b.steps.length && i < segs.length; i++) {
+      if (!b.steps[i]) continue;
+      if (blocked && blocked.test(segs[i])) failed = true; else this.move(b.steps[i], segs[i]);
+    }
+    if (failed) this.cancelWalk();
   },
   move(dir, plain) {
     const r = this.data.rooms;
@@ -346,7 +464,7 @@ const mapper = {
     ctx.clearRect(0, 0, w, h);
     const cs = getComputedStyle(document.documentElement), css = n => cs.getPropertyValue(n).trim();
     const V = this.view, S = V.scale, px = x => w / 2 + (x - V.cx) * S, py = y => h / 2 + (y - V.cy) * S;
-    const R = this.data.rooms, half = S * 0.28, vert = {};
+    const R = this.data.rooms, half = Math.max(2, S * 0.28), vert = {};
     $("zLabel").textContent = "Z " + V.z;
     const nrooms = Object.keys(R).length;
     $("coords").textContent = nrooms ? `${nrooms} rooms` : "Move to start mapping";
@@ -390,7 +508,7 @@ const mapper = {
     }
   },
   roomAt(mx, my) {
-    const cv = $("map"), V = this.view, S = V.scale, half = S * 0.32;
+    const cv = $("map"), V = this.view, S = V.scale, half = Math.max(4, S * 0.32);
     for (const k in this.data.rooms) {
       const r = this.data.rooms[k];
       if (r.z !== V.z) continue;
@@ -431,11 +549,13 @@ const mapper = {
     }
     drag = null;
   };
-  cv.onwheel = e => {
-    e.preventDefault();
-    mapper.view.scale = Math.min(120, Math.max(14, mapper.view.scale * (e.deltaY < 0 ? 1.12 : 1 / 1.12)));
+  const zoom = f => {
+    mapper.view.scale = Math.min(120, Math.max(2, mapper.view.scale * f));
     mapper.render();
   };
+  cv.onwheel = e => { e.preventDefault(); zoom(e.deltaY < 0 ? 1.12 : 1 / 1.12); };
+  $("zoomIn").onclick = () => zoom(1.25);
+  $("zoomOut").onclick = () => zoom(1 / 1.25);
   cv.ondblclick = e => {
     const r = cv.getBoundingClientRect(), k = mapper.roomAt(e.clientX - r.left, e.clientY - r.top);
     if (k) { mapper.select(k); $("rename").click(); }
@@ -470,13 +590,24 @@ Object.assign(mapper.opts, savedOpts || {});
 $("mapOn").checked = mapper.opts.on;
 $("nameOn").checked = mapper.opts.name;
 $("blocked").value = mapper.opts.blocked;
+$("aliases").value = mapper.opts.aliases;
+const loadAliases = () => { $("aliasCount").textContent = mapper.parseAliases(mapper.opts.aliases) + " recognised"; };
+loadAliases();
+$("aliases").oninput = e => { mapper.opts.aliases = e.target.value; loadAliases(); saveOpts(); };
 const saveOpts = () => store.set("mud:opts", JSON.stringify(mapper.opts));
-$("mapOn").onchange = e => { mapper.opts.on = e.target.checked; mapper.pending.length = 0; saveOpts(); };
+$("mapOn").onchange = e => { mapper.opts.on = e.target.checked; mapper.reset(); saveOpts(); };
 $("nameOn").onchange = e => { mapper.opts.name = e.target.checked; saveOpts(); };
 $("blocked").oninput = e => {
   try { new RegExp(e.target.value); e.target.style.borderColor = ""; mapper.opts.blocked = e.target.value; saveOpts(); }
   catch (err) { e.target.style.borderColor = "var(--bad)"; }
 };
+for (const [id, key] of [["promptRe", "prompt"], ["doEnd", "doEnd"]]) {
+  $(id).value = mapper.opts[key];
+  $(id).oninput = e => {
+    try { new RegExp(e.target.value); e.target.style.borderColor = ""; mapper.opts[key] = e.target.value; saveOpts(); }
+    catch (err) { e.target.style.borderColor = "var(--bad)"; }
+  };
+}
 $("export").onclick = () => {
   const a = document.createElement("a");
   a.href = URL.createObjectURL(new Blob([JSON.stringify(mapper.data)], { type: "application/json" }));
@@ -496,6 +627,48 @@ $("clear").onclick = () => {
   if (!confirm("Delete the whole map for this server?")) return;
   mapper.data = { rooms: {}, edges: {}, cur: null }; mapper.save(); mapper.select(null);
 };
+
+/* draggable divider between terminal and map */
+(() => {
+  const main = document.querySelector("main"), split = $("split");
+  const setWidth = px => {
+    if (px == null) main.style.removeProperty("--map-w");
+    else main.style.setProperty("--map-w", Math.round(Math.min(main.clientWidth - 206, Math.max(120, px))) + "px");
+    mapper.render();
+  };
+  split.onpointerdown = e => { split.setPointerCapture(e.pointerId); split.classList.add("on"); };
+  split.onpointermove = e => {
+    if (split.classList.contains("on")) setWidth(main.getBoundingClientRect().right - e.clientX - 3);
+  };
+  split.onpointerup = () => {
+    split.classList.remove("on");
+    store.set("mud:mapw", main.style.getPropertyValue("--map-w"));
+  };
+  split.ondblclick = () => { setWidth(null); store.set("mud:mapw", ""); };
+  const saved = store.get("mud:mapw");
+  if (saved) main.style.setProperty("--map-w", saved);
+})();
+
+/* draggable divider above the pinned live area */
+(() => {
+  const split = $("splitH"), term = $("term");
+  const setHeight = px => {
+    if (px == null) term.style.removeProperty("--live-h");
+    else term.style.setProperty("--live-h", Math.round(Math.min(term.clientHeight - 150, Math.max(40, px))) + "px");
+    syncLive();
+  };
+  split.onpointerdown = e => { split.setPointerCapture(e.pointerId); split.classList.add("on"); };
+  split.onpointermove = e => {
+    if (split.classList.contains("on")) setHeight(live.getBoundingClientRect().bottom - e.clientY - 3);
+  };
+  split.onpointerup = () => {
+    split.classList.remove("on");
+    store.set("mud:liveh", term.style.getPropertyValue("--live-h"));
+  };
+  split.ondblclick = () => { setHeight(null); store.set("mud:liveh", ""); };
+  const saved = store.get("mud:liveh");
+  if (saved) term.style.setProperty("--live-h", saved);
+})();
 
 /* startup */
 try { const l = JSON.parse(store.get("mud:last")); if (l) { $("host").value = l.host; $("port").value = l.port; } } catch (e) {}
