@@ -1,0 +1,506 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>MUD Client</title>
+<style>
+:root {
+  --bg: #12141a; --panel: #1a1d26; --line: #2b3040; --text: #d6d9e0; --dim: #7c8296;
+  --accent: #4fb3ff; --good: #55d38a; --bad: #ff6b6b;
+  --room: #2a3042; --room-line: #5b6480; --edge: #4a5270;
+}
+* { box-sizing: border-box; }
+html, body { height: 100%; margin: 0; }
+body { background: var(--bg); color: var(--text); font: 14px system-ui, sans-serif; display: flex; flex-direction: column; }
+header { display: flex; gap: 8px; align-items: center; padding: 8px 12px; background: var(--panel); border-bottom: 1px solid var(--line); flex-wrap: wrap; }
+header .status { color: var(--dim); margin-left: auto; }
+header .status.on { color: var(--good); }
+input, button, textarea { font: inherit; color: var(--text); background: var(--bg); border: 1px solid var(--line); border-radius: 6px; padding: 5px 9px; }
+button { cursor: pointer; background: var(--room); }
+button:hover { border-color: var(--accent); }
+button.primary { background: var(--accent); color: #07131f; border-color: var(--accent); font-weight: 600; }
+#host { width: 200px; } #port { width: 80px; }
+main { flex: 1; display: flex; min-height: 0; }
+#term { flex: 1 1 60%; display: flex; flex-direction: column; min-width: 0; }
+#out { flex: 1; overflow-y: auto; padding: 10px 12px; font: 14px/1.35 Consolas, "Cascadia Mono", monospace; white-space: pre-wrap; word-break: break-word; }
+#f { display: flex; padding: 8px; gap: 8px; border-top: 1px solid var(--line); background: var(--panel); }
+#cmd { flex: 1; font-family: Consolas, "Cascadia Mono", monospace; }
+#mapPane { flex: 1 1 40%; min-width: 280px; max-width: 640px; display: flex; flex-direction: column; border-left: 1px solid var(--line); background: var(--panel); }
+.bar { display: flex; gap: 6px; padding: 6px 8px; align-items: center; flex-wrap: wrap; border-bottom: 1px solid var(--line); }
+.bar .grow { flex: 1; color: var(--dim); min-width: 80px; }
+#mapWrap { flex: 1; position: relative; min-height: 120px; }
+#map { position: absolute; inset: 0; width: 100%; height: 100%; touch-action: none; cursor: grab; }
+#sel { color: var(--text); }
+details { padding: 6px 8px; border-top: 1px solid var(--line); }
+details label { display: block; margin: 6px 0; color: var(--dim); }
+details input[type=text] { width: 100%; margin-top: 3px; }
+.sys { color: var(--dim); font-style: italic; }
+.err { color: var(--bad); }
+@media (max-width: 800px) {
+  main { flex-direction: column; }
+  #mapPane { max-width: none; border-left: 0; border-top: 1px solid var(--line); flex: 0 0 45%; }
+}
+</style>
+</head>
+<body>
+<header>
+  <input id="host" placeholder="host" value="aardmud.org" spellcheck="false">
+  <input id="port" placeholder="port" value="4000" inputmode="numeric">
+  <button id="connect" class="primary">Connect</button>
+  <span id="status" class="status">Disconnected</span>
+</header>
+<main>
+  <section id="term">
+    <div id="out" aria-live="polite"></div>
+    <form id="f" autocomplete="off">
+      <input id="cmd" placeholder="Type a command (use ; to separate several)" spellcheck="false" autocapitalize="off">
+      <button>Send</button>
+    </form>
+  </section>
+  <aside id="mapPane">
+    <div class="bar">
+      <button id="zDown" title="Level down">▼</button>
+      <span id="zLabel">Z 0</span>
+      <button id="zUp" title="Level up">▲</button>
+      <button id="center" title="Re-centre on you and follow">Centre</button>
+      <span class="grow" id="coords"></span>
+    </div>
+    <div class="bar" id="selBar" hidden>
+      <span id="sel" class="grow"></span>
+      <button id="here">Set here</button>
+      <button id="walk">Walk</button>
+      <button id="rename">Name</button>
+      <button id="del">Delete</button>
+    </div>
+    <div id="mapWrap"><canvas id="map"></canvas></div>
+    <details>
+      <summary>Mapper settings</summary>
+      <label><input type="checkbox" id="mapOn" checked> Track movement</label>
+      <label><input type="checkbox" id="nameOn"> Use first line of output as room name</label>
+      <label>Failed-move pattern (regex)
+        <input type="text" id="blocked" spellcheck="false">
+      </label>
+      <div class="bar" style="border:0;padding:6px 0 0">
+        <button id="export">Export</button>
+        <button id="import">Import</button>
+        <button id="clear">Clear map</button>
+        <input type="file" id="file" accept="application/json" hidden>
+      </div>
+    </details>
+  </aside>
+</main>
+
+<script>
+"use strict";
+const $ = id => document.getElementById(id);
+const store = {
+  get(k) { try { return localStorage.getItem(k); } catch (e) { return null; } },
+  set(k, v) { try { localStorage.setItem(k, v); } catch (e) {} },
+};
+
+/* ---------- ANSI output ---------- */
+const BASIC = ["#000000","#cc3333","#33aa55","#ccaa33","#4477dd","#bb55bb","#33aaaa","#cccccc",
+               "#666666","#ff5555","#55ee77","#ffee55","#6699ff","#ff77ff","#55eeee","#ffffff"];
+function color256(n) {
+  if (n < 16) return BASIC[n];
+  if (n >= 232) { const v = 8 + (n - 232) * 10; return `rgb(${v},${v},${v})`; }
+  n -= 16;
+  const c = i => i ? 55 + i * 40 : 0;
+  return `rgb(${c(Math.floor(n / 36))},${c(Math.floor(n / 6) % 6)},${c(n % 6)})`;
+}
+const out = $("out");
+let sgr = {}, partialEsc = "";
+
+function applySgr(params) {
+  const p = params === "" ? [0] : params.split(";").map(Number);
+  for (let i = 0; i < p.length; i++) {
+    const n = p[i];
+    if (n === 0) sgr = {};
+    else if (n === 1) sgr.bold = true;
+    else if (n === 2) sgr.faint = true;
+    else if (n === 3) sgr.italic = true;
+    else if (n === 4) sgr.underline = true;
+    else if (n === 7) sgr.inverse = true;
+    else if (n === 22) { sgr.bold = false; sgr.faint = false; }
+    else if (n === 23) sgr.italic = false;
+    else if (n === 24) sgr.underline = false;
+    else if (n === 27) sgr.inverse = false;
+    else if (n >= 30 && n <= 37) sgr.fg = BASIC[n - 30];
+    else if (n >= 90 && n <= 97) sgr.fg = BASIC[n - 90 + 8];
+    else if (n === 39) delete sgr.fg;
+    else if (n >= 40 && n <= 47) sgr.bg = BASIC[n - 40];
+    else if (n >= 100 && n <= 107) sgr.bg = BASIC[n - 100 + 8];
+    else if (n === 49) delete sgr.bg;
+    else if ((n === 38 || n === 48) && p[i + 1] === 5) { sgr[n === 38 ? "fg" : "bg"] = color256(p[i + 2]); i += 2; }
+    else if ((n === 38 || n === 48) && p[i + 1] === 2) { sgr[n === 38 ? "fg" : "bg"] = `rgb(${p[i + 2]},${p[i + 3]},${p[i + 4]})`; i += 4; }
+  }
+}
+function addSpan(text, cls) {
+  if (!text) return;
+  const s = document.createElement("span");
+  s.textContent = text;
+  if (cls) s.className = cls;
+  else {
+    let fg = sgr.fg, bg = sgr.bg;
+    if (sgr.inverse) [fg, bg] = [bg || "#12141a", fg || "#d6d9e0"];
+    if (sgr.bold && !sgr.fg) fg = "#ffffff";
+    if (fg) s.style.color = fg;
+    if (bg) s.style.background = bg;
+    if (sgr.bold) s.style.fontWeight = "bold";
+    if (sgr.faint) s.style.opacity = ".6";
+    if (sgr.italic) s.style.fontStyle = "italic";
+    if (sgr.underline) s.style.textDecoration = "underline";
+  }
+  out.appendChild(s);
+}
+function print(text, cls) {
+  const stick = out.scrollHeight - out.scrollTop - out.clientHeight < 40;
+  if (cls) addSpan(text, cls);
+  else {
+    text = partialEsc + text.replace(/\r/g, "");
+    partialEsc = "";
+    const tail = text.match(/\x1b(\[[0-9;?]*)?$/);
+    if (tail) { partialEsc = tail[0]; text = text.slice(0, -tail[0].length); }
+    const re = /\x1b\[([0-9;?]*)([A-Za-z])/g;
+    let last = 0, m;
+    while ((m = re.exec(text))) {
+      addSpan(text.slice(last, m.index));
+      if (m[2] === "m") applySgr(m[1]);
+      last = re.lastIndex;
+    }
+    addSpan(text.slice(last));
+  }
+  while (out.childNodes.length > 4000) out.removeChild(out.firstChild);
+  if (stick) out.scrollTop = out.scrollHeight;
+}
+const stripAnsi = t => t.replace(/\x1b\[[0-9;?]*[A-Za-z]/g, "").replace(/\r/g, "");
+
+/* ---------- connection ---------- */
+let ws = null, connected = false;
+function setStatus(text, on) { const s = $("status"); s.textContent = text; s.classList.toggle("on", !!on); }
+
+function connect() {
+  const host = $("host").value.trim(), port = $("port").value.trim();
+  if (!host || !port) return;
+  store.set("mud:last", JSON.stringify({ host, port }));
+  mapper.load(host, port);
+  setStatus("Connecting…");
+  ws = new WebSocket(`ws://${location.host}/ws?host=${encodeURIComponent(host)}&port=${encodeURIComponent(port)}`);
+  const mine = ws;
+  ws.onopen = () => { connected = true; setStatus(`Connected to ${host}:${port}`, true); $("connect").textContent = "Disconnect"; $("cmd").focus(); };
+  ws.onmessage = e => {
+    const m = JSON.parse(e.data);
+    if (m.t === "data") { print(m.d); mapper.onData(stripAnsi(m.d)); }
+    else if (m.t === "echo") $("cmd").type = m.on ? "password" : "text";
+    else if (m.t === "error") print(m.d + "\n", "err");
+    else if (m.t === "closed") print("\n[Connection closed by host]\n", "sys");
+  };
+  ws.onclose = () => {
+    if (ws !== mine) return;
+    connected = false; ws = null;
+    setStatus("Disconnected"); $("connect").textContent = "Connect"; $("cmd").type = "text";
+    mapper.cancelWalk(); mapper.pending.length = 0;
+  };
+}
+$("connect").onclick = () => { if (ws) ws.close(); else connect(); };
+
+function sendCommand(raw, echo = true) {
+  if (!connected) { print("[Not connected]\n", "sys"); return; }
+  for (const part of raw.split(";")) {
+    const cmd = part.trim();
+    if (!cmd && raw.indexOf(";") >= 0) continue;
+    if (echo && $("cmd").type !== "password") print("> " + cmd + "\n", "sys");
+    ws.send(JSON.stringify({ t: "send", d: cmd }));
+    mapper.onCommand(cmd);
+  }
+}
+
+const history = []; let hpos = 0;
+$("f").onsubmit = e => {
+  e.preventDefault();
+  const v = $("cmd").value;
+  if (v && $("cmd").type !== "password" && history[history.length - 1] !== v) history.push(v);
+  hpos = history.length;
+  sendCommand(v);
+  $("cmd").select();
+};
+$("cmd").onkeydown = e => {
+  if (e.key === "ArrowUp" && hpos > 0) { $("cmd").value = history[--hpos]; e.preventDefault(); }
+  else if (e.key === "ArrowDown") { hpos = Math.min(hpos + 1, history.length); $("cmd").value = history[hpos] || ""; e.preventDefault(); }
+};
+
+/* ---------- mapper ---------- */
+const VEC = { n:[0,-1,0], s:[0,1,0], e:[1,0,0], w:[-1,0,0], ne:[1,-1,0], nw:[-1,-1,0], se:[1,1,0], sw:[-1,1,0], u:[0,0,1], d:[0,0,-1] };
+const LONG = { north:"n", south:"s", east:"e", west:"w", northeast:"ne", northwest:"nw", southeast:"se", southwest:"sw", up:"u", down:"d" };
+const DEFAULT_BLOCKED = "can'?t go that way|cannot go that way|no (obvious )?exit|alas, you cannot|you can'?t move|door is (closed|locked)|is locked|there is no way|not possible|you are too (tired|exhausted)";
+
+const mapper = {
+  key: null,
+  data: { rooms: {}, edges: {}, cur: null },
+  pending: [],
+  walk: null,
+  selected: null,
+  view: { cx: 0, cy: 0, scale: 40, z: 0, follow: true },
+  opts: { on: true, name: false, blocked: DEFAULT_BLOCKED },
+
+  load(host, port) {
+    this.key = `mudmap:${host}:${port}`;
+    try { this.data = JSON.parse(store.get(this.key)) || { rooms: {}, edges: {}, cur: null }; }
+    catch (e) { this.data = { rooms: {}, edges: {}, cur: null }; }
+    this.pending.length = 0; this.selected = null;
+    this.view.follow = true; this.syncView(); this.render();
+  },
+  save() {
+    clearTimeout(this._t);
+    this._t = setTimeout(() => { if (this.key) store.set(this.key, JSON.stringify(this.data)); }, 300);
+  },
+  rk: (x, y, z) => `${x},${y},${z}`,
+  ensureRoom(x, y, z) {
+    const k = this.rk(x, y, z);
+    if (!this.data.rooms[k]) this.data.rooms[k] = { x, y, z, name: "" };
+    return k;
+  },
+  edgeKey: (a, b) => a < b ? `${a}|${b}` : `${b}|${a}`,
+
+  onCommand(cmd) {
+    if (!this.opts.on) return;
+    const c = cmd.toLowerCase(), d = LONG[c] || c;
+    if (VEC[d]) { this.pending.push(d); if (this.pending.length > 20) this.pending.shift(); }
+  },
+  onData(plain) {
+    if (!this.opts.on || !this.pending.length) return;
+    const dir = this.pending.shift();
+    let re = null;
+    try { re = new RegExp(this.opts.blocked, "i"); } catch (e) {}
+    if (re && re.test(plain)) { this.cancelWalk(); return; }
+    this.move(dir, plain);
+  },
+  move(dir, plain) {
+    const r = this.data.rooms;
+    if (!this.data.cur || !r[this.data.cur]) this.data.cur = this.ensureRoom(0, 0, 0);
+    const from = r[this.data.cur], v = VEC[dir];
+    const to = this.ensureRoom(from.x + v[0], from.y + v[1], from.z + v[2]);
+    this.data.edges[this.edgeKey(this.data.cur, to)] = 1;
+    this.data.cur = to;
+    if (this.opts.name && !r[to].name) {
+      const line = plain.split("\n").map(s => s.trim()).find(s => s && !s.startsWith(">"));
+      if (line) r[to].name = line.slice(0, 60);
+    }
+    this.save(); this.syncView(); this.render();
+    this.stepWalk();
+  },
+
+  neighbours(k) {
+    const room = this.data.rooms[k], res = [];
+    for (const d in VEC) {
+      const v = VEC[d], nk = this.rk(room.x + v[0], room.y + v[1], room.z + v[2]);
+      if (this.data.edges[this.edgeKey(k, nk)]) res.push([d, nk]);
+    }
+    return res;
+  },
+  path(from, to) {
+    const prev = { [from]: null }, queue = [from];
+    while (queue.length) {
+      const k = queue.shift();
+      if (k === to) break;
+      for (const [d, nk] of this.neighbours(k)) if (!(nk in prev)) { prev[nk] = [k, d]; queue.push(nk); }
+    }
+    if (!(to in prev)) return null;
+    const dirs = [];
+    for (let k = to; prev[k]; k = prev[k][0]) dirs.unshift(prev[k][1]);
+    return dirs;
+  },
+  startWalk(to) {
+    const from = this.data.cur;
+    if (!connected) return print("[Not connected]\n", "sys");
+    if (!from) return;
+    const dirs = this.path(from, to);
+    if (!dirs) return print("[No known route there]\n", "sys");
+    if (!dirs.length) return;
+    this.walk = { dirs, waiting: false };
+    this.stepWalk();
+  },
+  stepWalk() {
+    const w = this.walk;
+    if (!w) return;
+    if (!w.dirs.length) { this.walk = null; return; }
+    clearTimeout(w.timer);
+    w.timer = setTimeout(() => {
+      if (this.walk === w && connected) sendCommand(w.dirs.shift(), false);
+    }, 250);
+  },
+  cancelWalk() { if (this.walk) { clearTimeout(this.walk.timer); this.walk = null; } },
+
+  syncView() {
+    const cur = this.data.rooms[this.data.cur];
+    if (cur && this.view.follow) { this.view.cx = cur.x; this.view.cy = cur.y; this.view.z = cur.z; }
+  },
+
+  /* drawing */
+  render() {
+    const cv = $("map"), ctx = cv.getContext("2d"), dpr = window.devicePixelRatio || 1;
+    const w = cv.clientWidth, h = cv.clientHeight;
+    if (cv.width !== Math.round(w * dpr) || cv.height !== Math.round(h * dpr)) { cv.width = Math.round(w * dpr); cv.height = Math.round(h * dpr); }
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    ctx.clearRect(0, 0, w, h);
+    const cs = getComputedStyle(document.documentElement), css = n => cs.getPropertyValue(n).trim();
+    const V = this.view, S = V.scale, px = x => w / 2 + (x - V.cx) * S, py = y => h / 2 + (y - V.cy) * S;
+    const R = this.data.rooms, half = S * 0.28, vert = {};
+    $("zLabel").textContent = "Z " + V.z;
+    const nrooms = Object.keys(R).length;
+    $("coords").textContent = nrooms ? `${nrooms} rooms` : "Move to start mapping";
+
+    ctx.lineWidth = Math.max(1.5, S * 0.05); ctx.strokeStyle = css("--edge");
+    ctx.beginPath();
+    for (const k in this.data.edges) {
+      const [a, b] = k.split("|"), ra = R[a], rb = R[b];
+      if (!ra || !rb) continue;
+      if (ra.z !== rb.z) {
+        const lo = ra.z < rb.z ? ra : rb, hi = lo === ra ? rb : ra;
+        (vert[this.rk(lo.x, lo.y, lo.z)] ||= {}).up = true;
+        (vert[this.rk(hi.x, hi.y, hi.z)] ||= {}).down = true;
+      } else if (ra.z === V.z) { ctx.moveTo(px(ra.x), py(ra.y)); ctx.lineTo(px(rb.x), py(rb.y)); }
+    }
+    ctx.stroke();
+
+    ctx.textAlign = "center"; ctx.textBaseline = "middle";
+    ctx.font = `${Math.max(9, S * 0.2)}px system-ui, sans-serif`;
+    for (const k in R) {
+      const r = R[k];
+      if (r.z !== V.z) continue;
+      const x = px(r.x), y = py(r.y);
+      if (x < -S || y < -S || x > w + S || y > h + S) continue;
+      const isCur = k === this.data.cur;
+      ctx.fillStyle = isCur ? css("--accent") : css("--room");
+      ctx.strokeStyle = k === this.selected ? css("--good") : css("--room-line");
+      ctx.lineWidth = k === this.selected ? 3 : 1.5;
+      ctx.fillRect(x - half, y - half, half * 2, half * 2);
+      ctx.strokeRect(x - half, y - half, half * 2, half * 2);
+      const vf = vert[k];
+      if (vf) {
+        ctx.fillStyle = isCur ? "#07131f" : css("--text");
+        if (vf.up) ctx.fillText("▲", x + half * 0.45, y - half * 0.4);
+        if (vf.down) ctx.fillText("▼", x + half * 0.45, y + half * 0.4);
+      }
+      if (r.name && S >= 36) {
+        ctx.fillStyle = css("--dim");
+        ctx.fillText(r.name.length > 14 ? r.name.slice(0, 13) + "…" : r.name, x, y + half + S * 0.16);
+      }
+    }
+  },
+  roomAt(mx, my) {
+    const cv = $("map"), V = this.view, S = V.scale, half = S * 0.32;
+    for (const k in this.data.rooms) {
+      const r = this.data.rooms[k];
+      if (r.z !== V.z) continue;
+      const x = cv.clientWidth / 2 + (r.x - V.cx) * S, y = cv.clientHeight / 2 + (r.y - V.cy) * S;
+      if (Math.abs(mx - x) <= half && Math.abs(my - y) <= half) return k;
+    }
+    return null;
+  },
+  select(k) {
+    this.selected = k;
+    const r = this.data.rooms[k];
+    $("selBar").hidden = !r;
+    if (r) $("sel").textContent = `${r.name || "Room"} (${r.x}, ${-r.y}, ${r.z})`;
+    this.render();
+  },
+};
+
+/* map interactions */
+(() => {
+  const cv = $("map");
+  let drag = null;
+  cv.onpointerdown = e => { cv.setPointerCapture(e.pointerId); drag = { x: e.clientX, y: e.clientY, moved: false }; cv.style.cursor = "grabbing"; };
+  cv.onpointermove = e => {
+    if (!drag) return;
+    const dx = e.clientX - drag.x, dy = e.clientY - drag.y;
+    if (Math.abs(dx) + Math.abs(dy) > 3) drag.moved = true;
+    if (!drag.moved) return;
+    const V = mapper.view;
+    V.cx -= dx / V.scale; V.cy -= dy / V.scale; V.follow = false;
+    drag.x = e.clientX; drag.y = e.clientY;
+    mapper.render();
+  };
+  cv.onpointerup = e => {
+    cv.style.cursor = "grab";
+    if (drag && !drag.moved) {
+      const r = cv.getBoundingClientRect();
+      mapper.select(mapper.roomAt(e.clientX - r.left, e.clientY - r.top));
+    }
+    drag = null;
+  };
+  cv.onwheel = e => {
+    e.preventDefault();
+    mapper.view.scale = Math.min(120, Math.max(14, mapper.view.scale * (e.deltaY < 0 ? 1.12 : 1 / 1.12)));
+    mapper.render();
+  };
+  cv.ondblclick = e => {
+    const r = cv.getBoundingClientRect(), k = mapper.roomAt(e.clientX - r.left, e.clientY - r.top);
+    if (k) { mapper.select(k); $("rename").click(); }
+  };
+  new ResizeObserver(() => mapper.render()).observe(cv);
+})();
+
+const level = d => { const V = mapper.view; V.z += d; V.follow = false; mapper.render(); };
+$("zUp").onclick = () => level(1);
+$("zDown").onclick = () => level(-1);
+$("center").onclick = () => { mapper.view.follow = true; mapper.syncView(); mapper.render(); };
+$("here").onclick = () => { if (mapper.selected) { mapper.data.cur = mapper.selected; mapper.save(); mapper.syncView(); mapper.render(); } };
+$("walk").onclick = () => { if (mapper.selected) mapper.startWalk(mapper.selected); };
+$("rename").onclick = () => {
+  const r = mapper.data.rooms[mapper.selected];
+  if (!r) return;
+  const n = prompt("Room name", r.name);
+  if (n !== null) { r.name = n.trim(); mapper.save(); mapper.select(mapper.selected); }
+};
+$("del").onclick = () => {
+  const k = mapper.selected, d = mapper.data;
+  if (!k) return;
+  delete d.rooms[k];
+  for (const e in d.edges) if (e.split("|").includes(k)) delete d.edges[e];
+  if (d.cur === k) d.cur = null;
+  mapper.save(); mapper.select(null);
+};
+
+/* settings, export/import */
+const savedOpts = (() => { try { return JSON.parse(store.get("mud:opts")); } catch (e) { return null; } })();
+Object.assign(mapper.opts, savedOpts || {});
+$("mapOn").checked = mapper.opts.on;
+$("nameOn").checked = mapper.opts.name;
+$("blocked").value = mapper.opts.blocked;
+const saveOpts = () => store.set("mud:opts", JSON.stringify(mapper.opts));
+$("mapOn").onchange = e => { mapper.opts.on = e.target.checked; mapper.pending.length = 0; saveOpts(); };
+$("nameOn").onchange = e => { mapper.opts.name = e.target.checked; saveOpts(); };
+$("blocked").oninput = e => {
+  try { new RegExp(e.target.value); e.target.style.borderColor = ""; mapper.opts.blocked = e.target.value; saveOpts(); }
+  catch (err) { e.target.style.borderColor = "var(--bad)"; }
+};
+$("export").onclick = () => {
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(new Blob([JSON.stringify(mapper.data)], { type: "application/json" }));
+  a.download = (mapper.key || "mudmap").replace(/[^\w.-]+/g, "_") + ".json";
+  a.click(); URL.revokeObjectURL(a.href);
+};
+$("import").onclick = () => $("file").click();
+$("file").onchange = async e => {
+  try {
+    const d = JSON.parse(await e.target.files[0].text());
+    if (!d.rooms || !d.edges) throw new Error("not a map file");
+    mapper.data = d; mapper.save(); mapper.select(null); mapper.syncView();
+  } catch (err) { alert("Could not import: " + err.message); }
+  e.target.value = "";
+};
+$("clear").onclick = () => {
+  if (!confirm("Delete the whole map for this server?")) return;
+  mapper.data = { rooms: {}, edges: {}, cur: null }; mapper.save(); mapper.select(null);
+};
+
+/* startup */
+try { const l = JSON.parse(store.get("mud:last")); if (l) { $("host").value = l.host; $("port").value = l.port; } } catch (e) {}
+mapper.load($("host").value.trim(), $("port").value.trim());
+print("Enter a host and port, then Connect.\nMovement commands (n, s, e, w, ne, nw, se, sw, u, d) are mapped automatically.\nClick a room to select it, then Walk to travel there. Drag to pan, scroll to zoom.\n", "sys");
+</script>
+</body>
+</html>
