@@ -78,6 +78,15 @@ details input[type=text], details textarea { width: 100%; margin-top: 3px; box-s
       <button id="center" title="Re-centre on you and follow">Centre</button>
       <span class="grow" id="coords"></span>
     </div>
+    <div class="bar">
+      <select id="mapSel" class="grow" title="Saved maps"></select>
+      <button id="mapNew" title="Start a new empty map">New</button>
+      <button id="mapSaveAs" title="Save a copy of this map under a new name">Save as</button>
+      <button id="mapDelete" title="Delete the selected map">Delete</button>
+    </div>
+    <div class="bar">
+      <input id="find" class="grow" placeholder="Find room by name (Enter for next)" spellcheck="false">
+    </div>
     <div class="bar" id="selBar" hidden>
       <span id="sel" class="grow"></span>
       <button id="here">Set here</button>
@@ -118,6 +127,8 @@ const $ = id => document.getElementById(id);
 const store = {
   get(k) { try { return localStorage.getItem(k); } catch (e) { return null; } },
   set(k, v) { try { localStorage.setItem(k, v); } catch (e) {} },
+  del(k) { try { localStorage.removeItem(k); } catch (e) {} },
+  keys() { try { return Object.keys(localStorage); } catch (e) { return []; } },
 };
 
 /* ---------- ANSI output ---------- */
@@ -326,16 +337,42 @@ const mapper = {
     return [];
   },
 
+  /* Maps are stored as "mudmap:<name>". Each server opens its default map (named host:port)
+     unless a different one was chosen for it. */
   load(host, port) {
-    this.key = `mudmap:${host}:${port}`;
-    try { this.data = JSON.parse(store.get(this.key)) || { rooms: {}, edges: {}, cur: null }; }
-    catch (e) { this.data = { rooms: {}, edges: {}, cur: null }; }
-    this.reset(); this.selected = null;
-    this.view.follow = true; this.syncView(); this.render();
+    this.server = `${host}:${port}`;
+    this.open(store.get("mud:map:" + this.server) || "mudmap:" + this.server);
   },
+  open(key) {
+    this.flush();
+    this.key = key;
+    try { this.data = JSON.parse(store.get(key)) || { rooms: {}, edges: {}, cur: null }; }
+    catch (e) { this.data = { rooms: {}, edges: {}, cur: null }; }
+    this.reset(); this.selected = null; $("selBar").hidden = true;
+    this.view.follow = true; this.syncView(); this.refreshMaps(); this.render();
+  },
+  choose(key) { store.set("mud:map:" + this.server, key); this.open(key); },
   save() {
     clearTimeout(this._t);
-    this._t = setTimeout(() => { if (this.key) store.set(this.key, JSON.stringify(this.data)); }, 300);
+    this._t = setTimeout(() => this.flush(), 300);
+  },
+  flush() {
+    clearTimeout(this._t);
+    if (this.key) store.set(this.key, JSON.stringify(this.data));
+  },
+  mapNames() {
+    const names = new Set(store.keys().filter(k => k.startsWith("mudmap:")));
+    if (this.key) names.add(this.key);
+    return [...names].sort();
+  },
+  refreshMaps() {
+    const sel = $("mapSel");
+    sel.textContent = "";
+    for (const k of this.mapNames()) {
+      const o = document.createElement("option");
+      o.value = k; o.textContent = k.slice(7); o.selected = k === this.key;
+      sel.appendChild(o);
+    }
   },
   rk: (x, y, z) => `${x},${y},${z}`,
   ensureRoom(x, y, z) {
@@ -622,6 +659,51 @@ $("file").onchange = async e => {
     mapper.data = d; mapper.save(); mapper.select(null); mapper.syncView();
   } catch (err) { alert("Could not import: " + err.message); }
   e.target.value = "";
+};
+/* saved maps */
+const cleanName = n => (n || "").trim().replace(/\s+/g, " ");
+$("mapSel").onchange = e => mapper.choose(e.target.value);
+$("mapNew").onclick = () => {
+  const name = cleanName(prompt("Name for the new map"));
+  if (!name) return;
+  const key = "mudmap:" + name;
+  if (store.get(key) !== null && !confirm(`A map named "${name}" already exists. Replace it with an empty one?`)) return;
+  store.set(key, JSON.stringify({ rooms: {}, edges: {}, cur: null }));
+  mapper.choose(key);
+};
+$("mapSaveAs").onclick = () => {
+  const name = cleanName(prompt("Save this map as", mapper.key.slice(7)));
+  if (!name) return;
+  const key = "mudmap:" + name;
+  if (key !== mapper.key && store.get(key) !== null && !confirm(`A map named "${name}" already exists. Overwrite it?`)) return;
+  mapper.flush();
+  store.set(key, JSON.stringify(mapper.data));
+  mapper.choose(key);
+};
+$("mapDelete").onclick = () => {
+  const key = mapper.key;
+  if (!confirm(`Delete the map "${key.slice(7)}"? This can't be undone.`)) return;
+  clearTimeout(mapper._t);
+  store.del(key);
+  mapper.key = null;
+  const fallback = "mudmap:" + mapper.server;
+  store.set("mud:map:" + mapper.server, fallback);
+  mapper.open(fallback);
+};
+/* find a room by name, to select it and then use Set here */
+let findAt = 0, findFor = "";
+$("find").oninput = () => { findAt = 0; $("find").style.borderColor = ""; };
+$("find").onkeydown = e => {
+  if (e.key !== "Enter") return;
+  const q = $("find").value.trim().toLowerCase();
+  if (!q) return;
+  if (q !== findFor) { findFor = q; findAt = 0; }
+  const hits = Object.keys(mapper.data.rooms).filter(k => mapper.data.rooms[k].name.toLowerCase().includes(q));
+  $("find").style.borderColor = hits.length ? "" : "var(--bad)";
+  if (!hits.length) return;
+  const k = hits[findAt++ % hits.length], r = mapper.data.rooms[k], V = mapper.view;
+  V.cx = r.x; V.cy = r.y; V.z = r.z; V.follow = false;
+  mapper.select(k);
 };
 $("clear").onclick = () => {
   if (!confirm("Delete the whole map for this server?")) return;
