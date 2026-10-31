@@ -144,12 +144,42 @@ function color256(n) {
 const out = $("out"), live = $("live");
 /* While scrolled up through history, a pinned copy of the newest output stays visible below. */
 const atBottom = () => out.scrollHeight - out.scrollTop - out.clientHeight < 40;
-function syncLive() {
-  const show = !atBottom();
+const LIVE_MAX = 400, OUT_MAX = 4000;
+function setLive(show) {
+  if (show && live.hidden) {
+    live.textContent = "";
+    for (const n of Array.prototype.slice.call(out.childNodes, -LIVE_MAX)) live.appendChild(n.cloneNode(true));
+  }
   $("splitH").hidden = live.hidden = !show;
   if (show) live.scrollTop = live.scrollHeight;
 }
+const syncLive = () => setLive(!atBottom());
 out.addEventListener("scroll", syncLive);
+
+/* Output is gathered in a fragment and written once per frame (or after 100ms if the tab is hidden),
+   so a burst of chunks costs one layout instead of one per chunk. */
+let outFrag = document.createDocumentFragment(), flushQueued = false;
+function queueFlush() {
+  if (flushQueued) return;
+  flushQueued = true;
+  requestAnimationFrame(flushOut);
+  setTimeout(flushOut, 100);
+}
+function flushOut() {
+  if (!flushQueued) return;
+  flushQueued = false;
+  if (!outFrag.firstChild) return;
+  const stick = atBottom(), frag = outFrag;
+  outFrag = document.createDocumentFragment();
+  if (!live.hidden) {
+    live.appendChild(frag.cloneNode(true));
+    while (live.childNodes.length > LIVE_MAX) live.removeChild(live.firstChild);
+  }
+  out.appendChild(frag);
+  while (out.childNodes.length > OUT_MAX) out.removeChild(out.firstChild);
+  if (stick) out.scrollTop = out.scrollHeight;
+  setLive(!stick);
+}
 let sgr = {}, partialEsc = "";
 
 function applySgr(params) {
@@ -192,12 +222,9 @@ function addSpan(text, cls) {
     if (sgr.italic) s.style.fontStyle = "italic";
     if (sgr.underline) s.style.textDecoration = "underline";
   }
-  out.appendChild(s);
-  live.appendChild(s.cloneNode(true));
-  while (live.childNodes.length > 400) live.removeChild(live.firstChild);
+  outFrag.appendChild(s);
 }
 function print(text, cls) {
-  const stick = out.scrollHeight - out.scrollTop - out.clientHeight < 40;
   if (cls) addSpan(text, cls);
   else {
     text = partialEsc + text.replace(/\r/g, "");
@@ -213,9 +240,7 @@ function print(text, cls) {
     }
     addSpan(text.slice(last));
   }
-  while (out.childNodes.length > 4000) out.removeChild(out.firstChild);
-  if (stick) out.scrollTop = out.scrollHeight;
-  syncLive();
+  queueFlush();
 }
 const stripAnsi = t => t.replace(/\x1b\[[0-9;?]*[A-Za-z]/g, "").replace(/\r/g, "");
 
@@ -276,7 +301,8 @@ $("cmd").onkeydown = e => {
 /* ---------- mapper ---------- */
 const VEC = { n:[0,-1,0], s:[0,1,0], e:[1,0,0], w:[-1,0,0], ne:[1,-1,0], nw:[-1,-1,0], se:[1,1,0], sw:[-1,1,0], u:[0,0,1], d:[0,0,-1] };
 const LONG = { north:"n", south:"s", east:"e", west:"w", northeast:"ne", northwest:"nw", southeast:"se", southwest:"sw", up:"u", down:"d" };
-const DEFAULT_BLOCKED = "can'?t go that way|cannot go that way|no (obvious )?exit|alas, you cannot|you can'?t move|door is (closed|locked)|is locked|there is no way|not possible|you are too (tired|exhausted)";
+const FORWARD = [[1, 0], [0, 1], [1, 1], [1, -1]];
+const DEFAULT_BLOCKED ="can'?t go that way|cannot go that way|no (obvious )?exit|alas, you cannot|you can'?t move|door is (closed|locked)|is locked|there is no way|not possible|you are too (tired|exhausted)";
 
 const mapper = {
   key: null,
@@ -387,7 +413,16 @@ const mapper = {
     const steps = this.expand(cmd, 0), c = cmd.trim().toLowerCase();
     if (steps.some(Boolean)) { this.pending.push({ steps, single: !!VEC[LONG[c] || c] }); if (this.pending.length > 50) this.pending.shift(); }
   },
-  re(src, flags) { try { return src ? new RegExp(src, flags) : null; } catch (e) { return null; } },
+  _res: {},
+  re(src, flags) {
+    const k = (flags || "") + "/" + src;
+    if (!(k in this._res)) {
+      try { this._res[k] = src ? new RegExp(src, flags) : null; } catch (e) { this._res[k] = null; }
+    }
+    const re = this._res[k];
+    if (re) re.lastIndex = 0;
+    return re;
+  },
   reset() {
     this.pending.length = 0;
     if (this.batch) { clearTimeout(this.batch.timer); this.batch = null; }
@@ -493,53 +528,65 @@ const mapper = {
   },
 
   /* drawing */
+  /* Redraws are coalesced: any number of render() calls in a frame cost one draw(). */
   render() {
+    if (this._raf) return;
+    this._raf = requestAnimationFrame(() => { this._raf = 0; this.draw(); });
+  },
+  draw() {
     const cv = $("map"), ctx = cv.getContext("2d"), dpr = window.devicePixelRatio || 1;
     const w = cv.clientWidth, h = cv.clientHeight;
     if (cv.width !== Math.round(w * dpr) || cv.height !== Math.round(h * dpr)) { cv.width = Math.round(w * dpr); cv.height = Math.round(h * dpr); }
     ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
     ctx.clearRect(0, 0, w, h);
     const cs = getComputedStyle(document.documentElement), css = n => cs.getPropertyValue(n).trim();
+    const C = { edge: css("--edge"), accent: css("--accent"), room: css("--room"), line: css("--room-line"), good: css("--good"), text: css("--text"), dim: css("--dim") };
     const V = this.view, S = V.scale, px = x => w / 2 + (x - V.cx) * S, py = y => h / 2 + (y - V.cy) * S;
-    const R = this.data.rooms, half = Math.max(2, S * 0.28), vert = {};
+    const R = this.data.rooms, E = this.data.edges, half = Math.max(2, S * 0.28);
+
+    /* Only rooms near the viewport matter. A room at most one cell outside it can still own an edge
+       that reaches in, and each edge is found from one end by looking along e, s, se and ne. */
+    let nrooms = 0;
+    const vis = [];
+    for (const k in R) {
+      nrooms++;
+      const r = R[k];
+      if (r.z !== V.z) continue;
+      const x = px(r.x), y = py(r.y);
+      if (x < -S || y < -S || x > w + S || y > h + S) continue;
+      vis.push({ k, r, x, y });
+    }
     $("zLabel").textContent = "Z " + V.z;
-    const nrooms = Object.keys(R).length;
     $("coords").textContent = nrooms ? `${nrooms} rooms` : "Move to start mapping";
 
-    ctx.lineWidth = Math.max(1.5, S * 0.05); ctx.strokeStyle = css("--edge");
+    ctx.lineWidth = Math.max(1.5, S * 0.05); ctx.strokeStyle = C.edge;
     ctx.beginPath();
-    for (const k in this.data.edges) {
-      const [a, b] = k.split("|"), ra = R[a], rb = R[b];
-      if (!ra || !rb) continue;
-      if (ra.z !== rb.z) {
-        const lo = ra.z < rb.z ? ra : rb, hi = lo === ra ? rb : ra;
-        (vert[this.rk(lo.x, lo.y, lo.z)] ||= {}).up = true;
-        (vert[this.rk(hi.x, hi.y, hi.z)] ||= {}).down = true;
-      } else if (ra.z === V.z) { ctx.moveTo(px(ra.x), py(ra.y)); ctx.lineTo(px(rb.x), py(rb.y)); }
+    for (const { k, r, x, y } of vis) {
+      for (const [dx, dy] of FORWARD) {
+        const nk = this.rk(r.x + dx, r.y + dy, r.z);
+        if (R[nk] && E[this.edgeKey(k, nk)]) { ctx.moveTo(x, y); ctx.lineTo(x + dx * S, y + dy * S); }
+      }
     }
     ctx.stroke();
 
     ctx.textAlign = "center"; ctx.textBaseline = "middle";
     ctx.font = `${Math.max(9, S * 0.2)}px system-ui, sans-serif`;
-    for (const k in R) {
-      const r = R[k];
-      if (r.z !== V.z) continue;
-      const x = px(r.x), y = py(r.y);
-      if (x < -S || y < -S || x > w + S || y > h + S) continue;
-      const isCur = k === this.data.cur;
-      ctx.fillStyle = isCur ? css("--accent") : css("--room");
-      ctx.strokeStyle = k === this.selected ? css("--good") : css("--room-line");
-      ctx.lineWidth = k === this.selected ? 3 : 1.5;
+    for (const { k, r, x, y } of vis) {
+      const isCur = k === this.data.cur, isSel = k === this.selected;
+      ctx.fillStyle = isCur ? C.accent : C.room;
+      ctx.strokeStyle = isSel ? C.good : C.line;
+      ctx.lineWidth = isSel ? 3 : 1.5;
       ctx.fillRect(x - half, y - half, half * 2, half * 2);
       ctx.strokeRect(x - half, y - half, half * 2, half * 2);
-      const vf = vert[k];
-      if (vf) {
-        ctx.fillStyle = isCur ? "#07131f" : css("--text");
-        if (vf.up) ctx.fillText("▲", x + half * 0.45, y - half * 0.4);
-        if (vf.down) ctx.fillText("▼", x + half * 0.45, y + half * 0.4);
+      const upKey = this.rk(r.x, r.y, r.z + 1), downKey = this.rk(r.x, r.y, r.z - 1);
+      const up = R[upKey] && E[this.edgeKey(k, upKey)], down = R[downKey] && E[this.edgeKey(k, downKey)];
+      if (up || down) {
+        ctx.fillStyle = isCur ? "#07131f" : C.text;
+        if (up) ctx.fillText("▲", x + half * 0.45, y - half * 0.4);
+        if (down) ctx.fillText("▼", x + half * 0.45, y + half * 0.4);
       }
       if (r.name && S >= 36) {
-        ctx.fillStyle = css("--dim");
+        ctx.fillStyle = C.dim;
         ctx.fillText(r.name.length > 14 ? r.name.slice(0, 13) + "…" : r.name, x, y + half + S * 0.16);
       }
     }
