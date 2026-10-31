@@ -437,34 +437,47 @@ const mapper = {
         if (blocked && blocked.test(plain)) this.cancelWalk(); else this.move(e.steps[0], plain);
         return;
       }
-      this.batch = { steps: e.steps, text: "", timer: null };
+      this.batch = { steps: e.steps, text: "", timer: null, done: 0, failed: false, progress: Date.now() };
+      this.render();
     }
-    /* A speedwalk or alias answers over several chunks: collect them until it reports it has finished. */
+    /* A speedwalk or alias answers over many chunks. Each step is applied as soon as its output is
+       complete; the batch is released when the MUD says it has finished, or it goes quiet. */
     const b = this.batch, end = this.re(this.opts.doEnd);
     b.text += plain;
     clearTimeout(b.timer);
-    if (end && end.test(b.text)) this.finishBatch();
-    else b.timer = setTimeout(() => this.finishBatch(), 2500);
+    this.applySteps(b, false);
+    if ((end && end.test(b.text)) || Date.now() - b.progress > 4000) this.finishBatch();
+    else b.timer = setTimeout(() => this.finishBatch(), b.done >= b.steps.length ? 500 : 2500);
   },
-  /* Each step prints a prompt, so the text after the Nth prompt is the result of the Nth step. */
+  /* Each step prints a prompt, so the text after the Nth prompt is the result of the Nth step. A step's
+     text is complete once the next prompt has appeared (or, when final, once the output has ended). */
+  applySteps(b, final) {
+    const blocked = this.re(this.opts.blocked, "i"), prompt = this.re(this.opts.prompt, "g");
+    const marks = prompt ? [...b.text.matchAll(prompt)] : [];
+    const ready = Math.min(b.steps.length, final ? marks.length : marks.length - 1);
+    const before = b.done;
+    for (; b.done < ready; b.done++) {
+      const i = b.done, from = marks[i].index + marks[i][0].length;
+      const seg = b.text.slice(from, i + 1 < marks.length ? marks[i + 1].index : undefined);
+      if (!b.steps[i]) continue;
+      if (blocked && blocked.test(seg)) b.failed = true; else this.move(b.steps[i], seg);
+    }
+    if (b.done > before) { b.progress = Date.now(); this.render(); }
+  },
   finishBatch() {
     const b = this.batch;
     if (!b) return;
     clearTimeout(b.timer); this.batch = null;
-    const blocked = this.re(this.opts.blocked, "i"), prompt = this.re(this.opts.prompt, "g");
-    const marks = prompt ? [...b.text.matchAll(prompt)] : [];
-    const segs = marks.map((m, i) => b.text.slice(m.index + m[0].length, i + 1 < marks.length ? marks[i + 1].index : undefined));
-    if (!segs.length) {
-      if (blocked && blocked.test(b.text)) { this.cancelWalk(); return; }
-      b.steps.forEach((dir, i) => dir && this.move(dir, i === b.steps.length - 1 ? b.text : ""));
-      return;
+    const prompt = this.re(this.opts.prompt, "g");
+    if (prompt && b.text.search(prompt) >= 0) this.applySteps(b, true);
+    else if (!b.done) {
+      /* No prompts to count by: treat the whole reply as one answer. */
+      const blocked = this.re(this.opts.blocked, "i");
+      if (blocked && blocked.test(b.text)) b.failed = true;
+      else b.steps.forEach((dir, i) => dir && this.move(dir, i === b.steps.length - 1 ? b.text : ""));
     }
-    let failed = false;
-    for (let i = 0; i < b.steps.length && i < segs.length; i++) {
-      if (!b.steps[i]) continue;
-      if (blocked && blocked.test(segs[i])) failed = true; else this.move(b.steps[i], segs[i]);
-    }
-    if (failed) this.cancelWalk();
+    if (b.failed) this.cancelWalk();
+    this.render();
   },
   move(dir, plain) {
     const r = this.data.rooms;
@@ -557,7 +570,8 @@ const mapper = {
       vis.push({ k, r, x, y });
     }
     $("zLabel").textContent = "Z " + V.z;
-    $("coords").textContent = nrooms ? `${nrooms} rooms` : "Move to start mapping";
+    const b = this.batch;
+    $("coords").textContent = (nrooms ? `${nrooms} rooms` : "Move to start mapping") + (b ? ` · speedwalk ${b.done}/${b.steps.length}` : "");
 
     ctx.lineWidth = Math.max(1.5, S * 0.05); ctx.strokeStyle = C.edge;
     ctx.beginPath();
