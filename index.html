@@ -411,7 +411,10 @@ const mapper = {
   onCommand(cmd) {
     if (!this.opts.on) return;
     const steps = this.expand(cmd, 0), c = cmd.trim().toLowerCase();
-    if (steps.some(Boolean)) { this.pending.push({ steps, single: !!VEC[LONG[c] || c] }); if (this.pending.length > 50) this.pending.shift(); }
+    if (!steps.some(Boolean)) return;
+    if (!this.pending.length && !this.batch) this.buf = "";
+    this.pending.push({ steps, single: !!VEC[LONG[c] || c], t: Date.now() });
+    if (this.pending.length > 50) this.pending.shift();
   },
   _res: {},
   re(src, flags) {
@@ -425,29 +428,72 @@ const mapper = {
   },
   reset() {
     this.pending.length = 0;
+    this.buf = ""; this.eatUntil = 0; clearTimeout(this.bufTimer);
     if (this.batch) { clearTimeout(this.batch.timer); this.batch = null; }
   },
+  buf: "", eatUntil: 0,
   onData(plain) {
     if (!this.opts.on) return;
-    if (!this.batch) {
-      if (!this.pending.length) return;
-      const e = this.pending.shift();
-      if (e.single) {
-        const blocked = this.re(this.opts.blocked, "i");
-        if (blocked && blocked.test(plain)) this.cancelWalk(); else this.move(e.steps[0], plain);
-        return;
+    if (this.batch) return this.feedBatch(plain);
+    /* A command the MUD never answered must not claim some later, unrelated output. */
+    const now = Date.now();
+    while (this.pending.length && now - this.pending[0].t > 15000) this.pending.shift();
+    if (!this.pending.length) { this.buf = ""; return; }
+    this.buf += plain;
+    this.drain();
+  },
+  /* Replies end with a prompt, however the network splits or bundles them, so commands are matched to
+     replies by counting prompts rather than chunks of data. */
+  drain() {
+    clearTimeout(this.bufTimer);
+    const prompt = this.re(this.opts.prompt, "g");
+    const nextPrompt = () => { if (!prompt) return null; prompt.lastIndex = 0; return prompt.exec(this.buf); };
+    for (;;) {
+      if (this.eatUntil > Date.now()) {                 /* the prompt that closes a speedwalk's last line */
+        const m = nextPrompt();
+        if (!m) break;
+        this.buf = this.buf.slice(m.index + m[0].length); this.eatUntil = 0;
+        continue;
       }
-      this.batch = { steps: e.steps, text: "", timer: null, done: 0, failed: false, progress: Date.now() };
-      this.render();
+      const e = this.pending[0];
+      if (!e) { this.buf = ""; return; }
+      if (!e.single) {
+        this.pending.shift();
+        this.batch = { steps: e.steps, text: "", timer: null, done: 0, failed: false, progress: Date.now() };
+        const text = this.buf; this.buf = "";
+        this.render();
+        return this.feedBatch(text);
+      }
+      const m = nextPrompt();
+      if (!m) break;
+      const seg = this.buf.slice(0, m.index);
+      this.buf = this.buf.slice(m.index + m[0].length);
+      this.pending.shift();
+      this.applySingle(e, seg);
     }
-    /* A speedwalk or alias answers over many chunks. Each step is applied as soon as its output is
-       complete; the batch is released when the MUD says it has finished, or it goes quiet. */
+    /* No prompt yet: if none ever shows up, take what has arrived as the reply. */
+    if (this.buf.trim()) this.bufTimer = setTimeout(() => {
+      this.eatUntil = 0;
+      const e = this.pending[0];
+      if (e && e.single && this.buf.trim()) { this.pending.shift(); const seg = this.buf; this.buf = ""; this.applySingle(e, seg); }
+      this.drain();
+    }, 800);
+  },
+  applySingle(e, seg) {
+    const blocked = this.re(this.opts.blocked, "i");
+    if (blocked && blocked.test(seg)) this.cancelWalk(); else this.move(e.steps[0], seg);
+  },
+  /* A speedwalk or alias answers over many chunks. Each step is applied as soon as its output is
+     complete; the batch is released when the MUD says it has finished, or it goes quiet. */
+  feedBatch(plain) {
     const b = this.batch, end = this.re(this.opts.doEnd);
     b.text += plain;
     clearTimeout(b.timer);
     this.applySteps(b, false);
-    if ((end && end.test(b.text)) || Date.now() - b.progress > 4000) this.finishBatch();
-    else b.timer = setTimeout(() => this.finishBatch(), b.done >= b.steps.length ? 500 : 2500);
+    const em = end && end.exec(b.text);
+    if (em) this.finishBatch(em.index + em[0].length);
+    else if (Date.now() - b.progress > 4000) this.finishBatch(-1);
+    else b.timer = setTimeout(() => this.finishBatch(-1), b.done >= b.steps.length ? 500 : 2500);
   },
   /* Each step prints a prompt, so the text after the Nth prompt is the result of the Nth step. A step's
      text is complete once the next prompt has appeared (or, when final, once the output has ended). */
@@ -464,20 +510,30 @@ const mapper = {
     }
     if (b.done > before) { b.progress = Date.now(); this.render(); }
   },
-  finishBatch() {
+  /* endAt is where the finished line ends in the batch's text, or -1 if it went quiet instead. */
+  finishBatch(endAt) {
     const b = this.batch;
     if (!b) return;
     clearTimeout(b.timer); this.batch = null;
+    let rest = "";
+    if (endAt >= 0) {
+      /* The finished line's own prompt closes the walk; whatever follows answers later commands. */
+      const tail = b.text.slice(endAt), p = this.re(this.opts.prompt, "g"), m = p && p.exec(tail);
+      b.text = b.text.slice(0, endAt);
+      if (m) rest = tail.slice(m.index + m[0].length); else if (p) this.eatUntil = Date.now() + 1500;
+    }
     const prompt = this.re(this.opts.prompt, "g");
     if (prompt && b.text.search(prompt) >= 0) this.applySteps(b, true);
-    else if (!b.done) {
+    else if (!b.done && b.text.trim()) {
       /* No prompts to count by: treat the whole reply as one answer. */
       const blocked = this.re(this.opts.blocked, "i");
       if (blocked && blocked.test(b.text)) b.failed = true;
       else b.steps.forEach((dir, i) => dir && this.move(dir, i === b.steps.length - 1 ? b.text : ""));
     }
     if (b.failed) this.cancelWalk();
+    this.buf = rest;
     this.render();
+    this.drain();
   },
   move(dir, plain) {
     const r = this.data.rooms;
