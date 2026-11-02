@@ -91,6 +91,7 @@ details input[type=text], details textarea { width: 100%; margin-top: 3px; box-s
       <span id="sel" class="grow"></span>
       <button id="here">Set here</button>
       <button id="walk">Walk</button>
+      <button id="exits" title="List or delete this room's custom exits">Exits</button>
       <button id="rename">Name</button>
       <button id="del">Delete</button>
     </div>
@@ -99,6 +100,7 @@ details input[type=text], details textarea { width: 100%; margin-top: 3px; box-s
       <summary>Mapper settings</summary>
       <label><input type="checkbox" id="mapOn" checked> Track movement</label>
       <label><input type="checkbox" id="nameOn"> Use first line of output as room name</label>
+      <label><input type="checkbox" id="exitOn" checked> Learn custom exits (commands that land in a mapped room; <code>#exit &lt;command&gt;</code> also maps a new room)</label>
       <label>Failed-move pattern (regex)
         <input type="text" id="blocked" spellcheck="false">
       </label>
@@ -276,11 +278,14 @@ $("connect").onclick = () => { if (ws) ws.close(); else connect(); };
 function sendCommand(raw, echo = true) {
   if (!connected) { print("[Not connected]\n", "sys"); return; }
   for (const part of raw.split(";")) {
-    const cmd = part.trim();
+    /* "#exit enter portal" sends the command and maps wherever it lands as a custom exit */
+    const force = /^#exit\s+\S/i.test(part.trim());
+    const cmd = part.trim().replace(/^#exit\s+/i, "");
     if (!cmd && raw.indexOf(";") >= 0) continue;
-    if (echo && $("cmd").type !== "password") print("> " + cmd + "\n", "sys");
+    const secret = $("cmd").type === "password";
+    if (echo && !secret) print("> " + cmd + "\n", "sys");
     ws.send(JSON.stringify({ t: "send", d: cmd }));
-    mapper.onCommand(cmd);
+    if (!secret) mapper.onCommand(cmd, force);
   }
 }
 
@@ -312,7 +317,7 @@ const mapper = {
   selected: null,
   view: { cx: 0, cy: 0, scale: 40, z: 0, follow: true },
   batch: null,
-  opts: { on: true, name: false, blocked: DEFAULT_BLOCKED, aliases: "", prompt: "HP:\\d+ EP:\\d+>", doEnd: "Do: Commands completed" },
+  opts: { on: true, name: false, exits: true, blocked: DEFAULT_BLOCKED, aliases: "", prompt: "HP:\\d+ EP:\\d+>", doEnd: "Do: Commands completed" },
   aliasMap: {},
 
   parseAliases(text) {
@@ -408,10 +413,19 @@ const mapper = {
   },
   edgeKey: (a, b) => a < b ? `${a}|${b}` : `${b}|${a}`,
 
-  onCommand(cmd) {
+  /* A command that is not a compass step may be a custom exit ("enter portal"). It is queued like a
+     single move so its reply can be matched to the room it lands in. A forced one (#exit) may also
+     create the room it lands in. */
+  onCommand(cmd, force) {
     if (!this.opts.on) return;
-    const steps = this.expand(cmd, 0), c = cmd.trim().toLowerCase();
-    if (!steps.some(Boolean)) return;
+    const steps = this.expand(cmd, 0), c = cmd.trim().toLowerCase().replace(/\s+/g, " ");
+    if (!steps.some(Boolean)) {
+      if (!c || steps.length > 1 || !this.data.cur || !(force || this.opts.exits)) return;
+      if (!this.pending.length && !this.batch) this.buf = "";
+      this.pending.push({ steps: [null], single: true, custom: c, force: !!force, t: Date.now() });
+      if (this.pending.length > 50) this.pending.shift();
+      return;
+    }
     if (!this.pending.length && !this.batch) this.buf = "";
     this.pending.push({ steps, single: !!VEC[LONG[c] || c], t: Date.now() });
     if (this.pending.length > 50) this.pending.shift();
@@ -481,7 +495,49 @@ const mapper = {
   },
   applySingle(e, seg) {
     const blocked = this.re(this.opts.blocked, "i");
-    if (blocked && blocked.test(seg)) this.cancelWalk(); else this.move(e.steps[0], seg);
+    if (blocked && blocked.test(seg)) this.cancelWalk();
+    else if (e.custom) this.customExit(e, seg);
+    else this.move(e.steps[0], seg);
+  },
+  /* The first line of a reply is taken to be the room's title. */
+  lines(seg) { return seg.split("\n").map(s => s.trim().slice(0, 60)).filter(s => s && !s.startsWith(">")); },
+  /* Where a custom command left you. A remembered exit is simply followed. Otherwise the reply is
+     compared with the titles of the rooms already mapped: one other room matching means that is where
+     you landed, and the exit is remembered. With #exit, an unrecognised arrival becomes a new room. */
+  customExit(e, seg) {
+    const R = this.data.rooms, here = R[this.data.cur];
+    if (!here) return;
+    const known = here.exits && here.exits[e.custom];
+    if (known && R[known]) return this.land(known, seg);
+    const lines = this.lines(seg).map(s => s.toLowerCase());
+    if (!lines.length) return;
+    const title = k => (R[k].sig || R[k].name || "").toLowerCase();
+    if (lines.includes(title(this.data.cur))) return this.cancelWalk();
+    const keys = Object.keys(R).filter(k => k !== this.data.cur && title(k));
+    for (const line of lines) {
+      const hits = keys.filter(k => title(k) === line);
+      if (hits.length === 1) return this.link(e.custom, hits[0], seg);
+      if (hits.length) return this.cancelWalk();
+    }
+    if (!e.force) return this.cancelWalk();
+    /* Nowhere known: put the new room in the nearest free cell at least two away. */
+    for (let d = 2; ; d++) for (let dx = -d; dx <= d; dx++) for (let dy = -d; dy <= d; dy++) {
+      if (Math.max(Math.abs(dx), Math.abs(dy)) !== d || R[this.rk(here.x + dx, here.y + dy, here.z)]) continue;
+      this.link(e.custom, this.ensureRoom(here.x + dx, here.y + dy, here.z), seg);
+      return;
+    }
+  },
+  link(cmd, to, seg) {
+    const here = this.data.rooms[this.data.cur];
+    (here.exits || (here.exits = {}))[cmd] = to;
+    this.land(to, seg);
+  },
+  land(to, seg) {
+    const r = this.data.rooms[to], line = this.lines(seg)[0];
+    if (line && !r.sig) r.sig = line;
+    this.data.cur = to;
+    this.save(); this.syncView(); this.render();
+    this.stepWalk();
   },
   /* A speedwalk or alias answers over many chunks. Each step is applied as soon as its output is
      complete; the batch is released when the MUD says it has finished, or it goes quiet. */
@@ -542,9 +598,10 @@ const mapper = {
     const to = this.ensureRoom(from.x + v[0], from.y + v[1], from.z + v[2]);
     this.data.edges[this.edgeKey(this.data.cur, to)] = 1;
     this.data.cur = to;
-    if (this.opts.name && !r[to].name) {
-      const line = plain.split("\n").map(s => s.trim()).find(s => s && !s.startsWith(">"));
-      if (line) r[to].name = line.slice(0, 60);
+    const line = this.lines(plain)[0];
+    if (line) {
+      if (!r[to].sig) r[to].sig = line;
+      if (this.opts.name && !r[to].name) r[to].name = line;
     }
     this.save(); this.syncView(); this.render();
     this.stepWalk();
@@ -556,6 +613,7 @@ const mapper = {
       const v = VEC[d], nk = this.rk(room.x + v[0], room.y + v[1], room.z + v[2]);
       if (this.data.edges[this.edgeKey(k, nk)]) res.push([d, nk]);
     }
+    for (const c in room.exits) if (this.data.rooms[room.exits[c]]) res.push([c, room.exits[c]]);
     return res;
   },
   path(from, to) {
@@ -638,6 +696,14 @@ const mapper = {
       }
     }
     ctx.stroke();
+
+    /* custom exits: dashed links to wherever they lead on this level */
+    ctx.save(); ctx.setLineDash([4, 4]); ctx.strokeStyle = C.accent; ctx.beginPath();
+    for (const { r, x, y } of vis) for (const c in r.exits) {
+      const t = R[r.exits[c]];
+      if (t && t.z === r.z) { ctx.moveTo(x, y); ctx.lineTo(px(t.x), py(t.y)); }
+    }
+    ctx.stroke(); ctx.restore();
 
     ctx.textAlign = "center"; ctx.textBaseline = "middle";
     ctx.font = `${Math.max(9, S * 0.2)}px system-ui, sans-serif`;
@@ -729,11 +795,20 @@ $("rename").onclick = () => {
   const n = prompt("Room name", r.name);
   if (n !== null) { r.name = n.trim(); mapper.save(); mapper.select(mapper.selected); }
 };
+$("exits").onclick = () => {
+  const r = mapper.data.rooms[mapper.selected];
+  if (!r) return;
+  const list = Object.entries(r.exits || {});
+  if (!list.length) return alert("No custom exits from this room yet.\nType #exit <command> in a room to map one.");
+  const c = prompt("Custom exits from here (type one to delete it):\n" + list.map(([c, k]) => `${c} → ${mapper.data.rooms[k]?.name || k}`).join("\n"));
+  if (c && r.exits[c.trim().toLowerCase()]) { delete r.exits[c.trim().toLowerCase()]; mapper.save(); mapper.render(); }
+};
 $("del").onclick = () => {
   const k = mapper.selected, d = mapper.data;
   if (!k) return;
   delete d.rooms[k];
   for (const e in d.edges) if (e.split("|").includes(k)) delete d.edges[e];
+  for (const o in d.rooms) for (const c in d.rooms[o].exits) if (d.rooms[o].exits[c] === k) delete d.rooms[o].exits[c];
   if (d.cur === k) d.cur = null;
   mapper.save(); mapper.select(null);
 };
@@ -751,6 +826,8 @@ $("aliases").oninput = e => { mapper.opts.aliases = e.target.value; loadAliases(
 const saveOpts = () => store.set("mud:opts", JSON.stringify(mapper.opts));
 $("mapOn").onchange = e => { mapper.opts.on = e.target.checked; mapper.reset(); saveOpts(); };
 $("nameOn").onchange = e => { mapper.opts.name = e.target.checked; saveOpts(); };
+$("exitOn").checked = mapper.opts.exits;
+$("exitOn").onchange = e => { mapper.opts.exits = e.target.checked; saveOpts(); };
 $("blocked").oninput = e => {
   try { new RegExp(e.target.value); e.target.style.borderColor = ""; mapper.opts.blocked = e.target.value; saveOpts(); }
   catch (err) { e.target.style.borderColor = "var(--bad)"; }
