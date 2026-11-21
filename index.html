@@ -96,10 +96,13 @@ details input[type=text], details textarea { width: 100%; margin-top: 3px; box-s
     </div>
     <div class="bar">
       <input id="find" class="grow" placeholder="Find room by name (Enter for next)" spellcheck="false">
+      <button id="tidy" title="Re-place every room from its links so tangled or overlapping areas come apart">Tidy map</button>
+      <button id="tidyUndo" title="Put the map back as it was before the last tidy" hidden>Undo tidy</button>
     </div>
     <div class="bar" id="selBar" hidden>
       <span id="sel" class="grow"></span>
       <button id="here">Set here</button>
+      <button id="fleeRoom" title="Mark this room as where fleeing from the guild hall puts you">Flee room</button>
       <button id="merge" title="Merge the selected room into the room you are in (shift-click a room to select it without walking)">Merge here</button>
       <button id="exits" title="List or delete this room's custom exits">Exits</button>
       <button id="rename">Name</button>
@@ -120,6 +123,9 @@ details input[type=text], details textarea { width: 100%; margin-top: 3px; box-s
       </label>
       <label>Travel finished pattern (regex; optional, otherwise it ends when the output goes quiet)
         <input type="text" id="travelEnd" spellcheck="false">
+      </label>
+      <label>Flee line (regex; when it appears you are moved to the room marked with Flee room)
+        <input type="text" id="fleeRe" spellcheck="false">
       </label>
       <label>Failed-move pattern (regex)
         <input type="text" id="blocked" spellcheck="false">
@@ -408,6 +414,7 @@ $("trigAdd").onclick = () => { triggers.list.push({ on: true, pats: "", cmd: "" 
 
 /* ---------- mapper ---------- */
 const VEC = { n:[0,-1,0], s:[0,1,0], e:[1,0,0], w:[-1,0,0], ne:[1,-1,0], nw:[-1,-1,0], se:[1,1,0], sw:[-1,1,0], u:[0,0,1], d:[0,0,-1] };
+const isDir = s => typeof s === "string" && !!VEC[s];
 const WALK_AHEAD = 5; /* compass steps a map walk keeps in flight */
 const LONG = { north:"n", south:"s", east:"e", west:"w", northeast:"ne", northwest:"nw", southeast:"se", southwest:"sw", up:"u", down:"d" };
 const FORWARD = [[1, 0], [0, 1], [1, 1], [1, -1]];
@@ -422,7 +429,7 @@ const mapper = {
   selected: null,
   view: { cx: 0, cy: 0, scale: 40, z: 0, follow: true },
   batch: null,
-  opts: { on: true, name: false, exits: true, expand: true, arrive: "", travel: "travelto, t", travelEnd: "Travelto: Destination reached", blocked: DEFAULT_BLOCKED, aliases: "", prompt: "HP:\\d+ EP:\\d+>", doEnd: "Do: Commands completed" },
+  opts: { on: true, name: false, exits: true, expand: true, arrive: "", flee: "You flee from the guild hall", travel: "travelto, t", travelEnd: "Travelto: Destination reached", blocked: DEFAULT_BLOCKED, aliases: "", prompt: "HP:\\d+ EP:\\d+>", doEnd: "Do: Commands completed" },
   aliasMap: {},
 
   parseAliases(text) {
@@ -446,12 +453,13 @@ const mapper = {
       if (body) map[m[1].toLowerCase().replace(/\s+/g, " ")] = body;
     }
     this.aliasMap = map;
-    return Object.keys(map).filter(k => this.expand(k, 0).some(Boolean)).length;
+    return Object.keys(map).filter(k => this.expand(k, 0).some(isDir)).length;
   },
   /* The steps a command would take, following aliases and 3n2e-style speedwalks: a direction for each
      compass step, and null for any other step so that the list still lines up with the MUD's output. */
   expand(cmd, depth) {
-    const steps = p => { const r = this.expand(p, depth + 1); return r.length ? r : [null]; };
+    /* A step that is not a compass move keeps its text, {cmd}, so a custom exit in an alias is mapped too. */
+    const steps = p => { const r = this.expand(p, depth + 1), t = p.trim().toLowerCase().replace(/\s+/g, " "); return r.length ? r : [t ? { cmd: t } : null]; };
     const c = cmd.trim().toLowerCase().replace(/\s+/g, " ");
     const doList = c.match(/^do\s+(.+)$/);
     if (doList && depth <= 5) return doList[1].split(",").flatMap(steps);
@@ -533,7 +541,7 @@ const mapper = {
       if (this.pending.length > 50) this.pending.shift();
       return;
     }
-    if (!steps.some(Boolean)) {
+    if (!steps.some(isDir)) {
       if (!c || steps.length > 1 || !this.data.cur || !(force || this.opts.exits)) return;
       if (!this.pending.length && !this.batch) this.buf = "";
       this.pending.push({ steps: [null], single: true, custom: c, force: !!force, t: Date.now() });
@@ -560,8 +568,53 @@ const mapper = {
     if (this.batch) { clearTimeout(this.batch.timer); this.batch = null; }
   },
   buf: "", eatUntil: 0,
+  /* Fleeing teleports you, so the walk, any pending replies and the explorer are dropped and the map
+     puts you in the room marked as the flee room. With none marked yet, the room the MUD shows next is
+     matched by title to a mapped room, and that room becomes the flee room. */
+  fleeTail: "",
+  fleeLearn: null,
+  checkFlee(plain) {
+    if (this.fleeLearn) { this.fleeLearn.text += plain; return this.learnFlee(); }
+    const re = this.re(this.opts.flee, "i");
+    if (!re) return false;
+    this.fleeTail = (this.fleeTail + plain).slice(-400);
+    const m = re.exec(this.fleeTail);
+    if (!m) return false;
+    const after = this.fleeTail.slice(m.index + m[0].length);
+    this.fleeTail = "";
+    const k = this.data.flee;
+    if (k && this.data.rooms[k]) { this.fleeTo(k); return true; }
+    this.fleeLearn = { text: after };
+    return this.learnFlee();
+  },
+  learnFlee() {
+    const x = this.fleeLearn, R = this.data.rooms, nl = x.text.indexOf("\n");
+    if (nl < 0 && x.text.length < 300) return true;
+    const rest = x.text.slice(nl + 1), end = rest.indexOf("\n");
+    if (end < 0 && rest.length < 300) return true;
+    this.fleeLearn = null;
+    const p = this.re(this.opts.prompt, "g"), line = this.lines(end < 0 ? rest : rest.slice(0, end))[0] || "";
+    const title = this.norm(p ? line.replace(p, "") : line);
+    const keys = Object.keys(R).filter(k => title && this.norm(R[k].sig || R[k].name) === title);
+    if (keys.length !== 1) {
+      print(`[Flee: could not tell which mapped room "${line}" is. Select it and press Flee room]\n`, "sys");
+      return true;
+    }
+    this.data.flee = keys[0];
+    this.fleeTo(keys[0]);
+    return true;
+  },
+  fleeTo(k) {
+    this.stopExplore("you fled");
+    this.cancelWalk();
+    this.reset();
+    this.data.cur = k;
+    this.save(); this.syncView(); this.render();
+    print("[Map moved to the flee room]\n", "sys");
+  },
   onData(plain) {
     if (!this.opts.on) return;
+    if (this.checkFlee(plain)) return;
     if (this.batch) return this.feedBatch(plain);
     /* A command the MUD never answered must not claim some later, unrelated output. */
     const now = Date.now();
@@ -624,12 +677,19 @@ const mapper = {
     if (!here) return;
     const known = here.exits && here.exits[e.custom];
     if (known && R[known]) return this.land(known, seg);
+    /* A reply that has a room line (a title ending in its exits) is an arrival, whatever came before it. */
+    const raw = this.lines(seg), at = raw.slice(0, 4).findIndex(l => this.exitWords(l));
+    if (at >= 0) seg = raw.slice(at).join("\n");
     const lines = this.lines(seg).map(s => this.norm(s));
     if (!lines.length) return;
-    const arrive = this.re(this.opts.arrive, "i"), force = e.force || !!(arrive && arrive.test(seg));
+    const arrive = this.re(this.opts.arrive, "i"), force = e.force || at >= 0 || !!(arrive && arrive.test(seg));
     const title = k => this.norm(R[k].sig || R[k].name);
-    if (lines.includes(title(this.data.cur))) return this.cancelWalk();
-    const keys = Object.keys(R).filter(k => k !== this.data.cur && title(k));
+    /* Rooms often share a title ("Amon Din"), so a room line's exits tell them apart: a room whose known
+       exits differ from the ones just shown is a different room. */
+    const shown = at >= 0 ? (this.exitWords(raw[at]) || []).filter(t => !VEC[t][2]).sort().join() : null;
+    const alike = k => shown === null || !R[k].ex || R[k].ex.slice().sort().join() === shown;
+    if (!e.force && lines.includes(title(this.data.cur)) && alike(this.data.cur)) return this.cancelWalk();
+    const keys = Object.keys(R).filter(k => k !== this.data.cur && title(k) && alike(k));
     for (const line of lines) {
       const hits = keys.filter(k => title(k) === line);
       if (hits.length === 1) return this.link(e.custom, hits[0], seg);
@@ -639,14 +699,34 @@ const mapper = {
     if (!force) return this.cancelWalk();
     this.newRoom(e.custom, here, seg);
   },
-  /* Nowhere known: put the new room in the nearest free cell at least two away. */
+  /* Nowhere known. Custom exits and travel destinations lead into a pocket level of their own. Within a
+     pocket the new room goes right beside the room you left: a free cell towards the middle that no
+     listed exit uses, or, if there is none, a cell opened up by spreading the pocket apart. */
   newRoom(cmd, here, seg) {
-    const R = this.data.rooms;
-    for (let d = 2; ; d++) for (let dx = -d; dx <= d; dx++) for (let dy = -d; dy <= d; dy++) {
-      if (Math.max(Math.abs(dx), Math.abs(dy)) !== d || R[this.rk(here.x + dx, here.y + dy, here.z)]) continue;
-      this.link(cmd, this.ensureRoom(here.x + dx, here.y + dy, here.z), seg);
-      return;
+    const R = this.data.rooms, d0 = this.data;
+    /* Leaving the main map by a custom exit starts a pocket of its own on a new level, so its rooms never
+       collide with, or stretch, the rooms already mapped. Further moves from there stay on that level. */
+    if (!(d0.pockets || []).includes(here.z)) {
+      const z = Math.max(...Object.values(R).map(r => r.z)) + 1;
+      (d0.pockets || (d0.pockets = [])).push(z);
+      return this.link(cmd, this.ensureRoom(here.x, here.y, z), seg);
     }
+    const all = Object.values(R).filter(r => r.z === here.z);
+    const lo = [Math.min(...all.map(r => r.x)), Math.min(...all.map(r => r.y))], hi = [Math.max(...all.map(r => r.x)), Math.max(...all.map(r => r.y))];
+    const mid = [all.reduce((a, r) => a + r.x, 0) / all.length, all.reduce((a, r) => a + r.y, 0) / all.length];
+    const dirs = Object.keys(VEC).filter(d => !VEC[d][2]), used = new Set(here.ex || []);
+    const spot = d => [here.x + VEC[d][0], here.y + VEC[d][1], here.z];
+    const free = d => !this.data.rooms[this.rk(...spot(d))];
+    const inside = d => { const [x, y] = spot(d); return x >= lo[0] && x <= hi[0] && y >= lo[1] && y <= hi[1]; };
+    const away = d => { const [x, y] = spot(d); return Math.hypot(x - mid[0], y - mid[1]); };
+    const byMiddle = list => list.slice().sort((a, b) => away(a) - away(b));
+    const open = dirs.filter(d => !used.has(d));
+    let d = byMiddle(open.filter(x => free(x) && inside(x)))[0];
+    if (!d) {
+      d = byMiddle(open.length ? open : dirs)[0];
+      if (!free(d)) this.makeRoom(here, VEC[d]);
+    }
+    this.link(cmd, this.ensureRoom(...spot(d)), seg);
   },
   /* A travel command has finished. Only the last room's output is looked at: rooms passed on the way
      are not mapped. A remembered destination is followed; otherwise the room is matched by title. */
@@ -675,7 +755,7 @@ const mapper = {
   },
   /* Room titles are compared without the status flags the MUD puts before them, "(disguise, wimpy off)",
      or the exits it puts after, "(e, nw and s)". */
-  norm: s => (s || "").toLowerCase().replace(/^\s*(\([^)]*\)\s*)+/, "").replace(/\s*\([^)]*\)?\s*$/, "").trim(),
+  norm: s => (s || "").toLowerCase().replace(/^\s*(\([^)]*\)\s*)+/, "").replace(/(\s*\[[^\]]*\])+\s*$/, "").replace(/\s*\([^)]*\)?\s*$/, "").trim(),
   nearest(here, keys) {
     const R = this.data.rooms, dist = k => Math.max(Math.abs(R[k].x - here.x), Math.abs(R[k].y - here.y)) + Math.abs(R[k].z - here.z) * 3;
     return keys.reduce((a, b) => dist(b) < dist(a) ? b : a);
@@ -721,8 +801,11 @@ const mapper = {
     for (; b.done < ready; b.done++) {
       const i = b.done, from = marks[i].index + marks[i][0].length;
       const seg = b.text.slice(from, i + 1 < marks.length ? marks[i + 1].index : undefined);
-      if (!b.steps[i]) continue;
-      if (blocked && blocked.test(seg)) b.failed = true; else this.move(b.steps[i], seg);
+      const st = b.steps[i];
+      if (!st) continue;
+      if (blocked && blocked.test(seg)) b.failed = true;
+      else if (isDir(st)) this.move(st, seg);
+      else if (this.opts.exits) this.customExit({ custom: st.cmd, force: false }, seg);
     }
     if (b.done > before) { b.progress = Date.now(); this.render(); }
   },
@@ -750,7 +833,7 @@ const mapper = {
       /* No prompts to count by: treat the whole reply as one answer. */
       const blocked = this.re(this.opts.blocked, "i");
       if (blocked && blocked.test(b.text)) b.failed = true;
-      else b.steps.forEach((dir, i) => dir && this.move(dir, i === b.steps.length - 1 ? b.text : ""));
+      else b.steps.forEach((dir, i) => isDir(dir) && this.move(dir, i === b.steps.length - 1 ? b.text : ""));
     }
     if (b.failed) this.cancelWalk();
     this.buf = rest;
@@ -785,6 +868,7 @@ const mapper = {
     }
     d.rooms = nr; d.edges = ne;
     d.cur = map[d.cur] || d.cur;
+    if (d.flee) d.flee = map[d.flee] || d.flee;
     if (this.selected) this.selected = map[this.selected] || this.selected;
   },
   /* The cell beyond `from` in direction v is taken by a different room. Every room at or beyond that
@@ -833,6 +917,78 @@ const mapper = {
     this.relayout(pos);
     this.save(); this.syncView(); this.select(this.data.cur === into || R[into] ? into : this.data.cur);
   },
+  /* Re-places every room from its links alone, for when the map has got tangled. Rooms joined by a link
+     (or a compass-named exit) keep their direction from each other. A link that would land on a room
+     already placed is dropped to an exit and its room goes to the nearest free cell. Each group of
+     connected rooms stays anchored where its first room was (the room you are in, if it is in the group),
+     so the overall shape is kept. Returns false when nothing needed to move. */
+  tidy() {
+    const d = this.data, R = d.rooms, keys = Object.keys(R);
+    const unit = v => Object.keys(VEC).find(k => VEC[k].every((c, i) => c === v[i]));
+    const opp = n => Object.keys(VEC).find(k => VEC[k].every((c, i) => c === -VEC[n][i]));
+    const near = {};
+    const join = (a, b, v) => { (near[a] || (near[a] = [])).push([b, v]); (near[b] || (near[b] = [])).push([a, v.map(c => -c)]); };
+    for (const e in d.edges) {
+      const [a, b] = e.split("|");
+      if (!R[a] || !R[b]) continue;
+      const v = [R[b].x - R[a].x, R[b].y - R[a].y, R[b].z - R[a].z];
+      if (unit(v)) join(a, b, v);
+    }
+    for (const k of keys) for (const c in R[k].exits || {}) {
+      const t = R[k].exits[c];
+      if (VEC[c] && R[t] && t !== k) join(k, t, VEC[c]);
+    }
+    const placed = {}, used = new Set(), seen = new Set(), comps = [];
+    for (const k of keys) {
+      if (seen.has(k)) continue;
+      const c = [k]; seen.add(k);
+      for (let i = 0; i < c.length; i++) for (const [n] of near[c[i]] || []) if (!seen.has(n)) { seen.add(n); c.push(n); }
+      comps.push(c);
+    }
+    comps.sort((a, b) => b.length - a.length);
+    const free = (x, y, z) => !used.has(this.rk(x, y, z));
+    const take = (k, p) => { placed[k] = p; used.add(this.rk(p[0], p[1], p[2])); };
+    const nearest = (x, y, z) => {
+      for (let n = 0; ; n++) for (let dx = -n; dx <= n; dx++) for (let dy = -n; dy <= n; dy++)
+        if (Math.max(Math.abs(dx), Math.abs(dy)) === n && free(x + dx, y + dy, z)) return [x + dx, y + dy, z];
+    };
+    for (const comp of comps) {
+      const seed = comp.includes(d.cur) ? d.cur : comp[0], S = R[seed];
+      take(seed, nearest(S.x, S.y, S.z));
+      const q = [seed], later = [];
+      for (;;) {
+        while (q.length) {
+          const u = q.shift(), p = placed[u];
+          for (const [v, vec] of near[u] || []) {
+            if (placed[v]) continue;
+            const t = [p[0] + vec[0], p[1] + vec[1], p[2] + vec[2]];
+            if (free(...t)) { take(v, t); q.push(v); } else later.push([v, t]);
+          }
+        }
+        const i = later.findIndex(([v]) => !placed[v]);
+        if (i < 0) break;
+        const [v, t] = later.splice(i, 1)[0];
+        take(v, nearest(...t)); q.push(v);
+      }
+    }
+    const pos = {};
+    for (const k of keys) if (placed[k][0] !== R[k].x || placed[k][1] !== R[k].y || placed[k][2] !== R[k].z) pos[k] = placed[k];
+    if (!Object.keys(pos).length) return false;
+    this.relayout(pos);
+    /* Compass exits that now point at a neighbouring room become ordinary links. */
+    for (const k in d.rooms) {
+      const r = d.rooms[k], ex = r.exits;
+      if (!ex) continue;
+      for (const c in ex) {
+        const t = d.rooms[ex[c]];
+        if (!VEC[c] || !t || [r.x, r.y, r.z].some((q, i) => q + VEC[c][i] !== [t.x, t.y, t.z][i])) continue;
+        d.edges[this.edgeKey(k, ex[c])] = 1;
+        if (t.exits && t.exits[opp(c)] === k) delete t.exits[opp(c)];
+        delete ex[c];
+      }
+    }
+    return true;
+  },
   /* Room m becomes room o: links and exits to m go to o instead. Where they will no longer be side by
      side (finals gives where rooms are heading) they become exits. */
   fold(m, o, finals) {
@@ -860,7 +1016,32 @@ const mapper = {
     if (!O.name && M.name) O.name = M.name;
     if (!O.sig && M.sig) O.sig = M.sig;
     if (d.cur === m) d.cur = o;
+    if (d.flee === m) d.flee = o;
     delete R[m];
+  },
+  /* Does mapped room `room` look like the room line `seen`: the same title and, where both are known,
+     the same compass exits. */
+  sameRoom(room, seen) {
+    if (room.sig && this.norm(room.sig) !== this.norm(seen)) return false;
+    const w = this.exitWords(seen);
+    return !w || !room.ex || room.ex.slice().sort().join() === w.filter(x => !VEC[x][2]).sort().join();
+  },
+  /* A mapped room with this title and these exact exits (several: the nearest). */
+  lookalike(cur, seen) {
+    const R = this.data.rooms;
+    if (!this.exitWords(seen)) return null;
+    const c = Object.keys(R).filter(k => k !== cur && R[k].ex && R[k].sig && this.sameRoom(R[k], seen));
+    return c.length > 1 ? this.nearest(R[cur], c) : c[0] || null;
+  },
+  /* The mapped room that has a custom exit into `cur` and looks like the room line `seen`. */
+  backRoom(cur, seen) {
+    const R = this.data.rooms, t = this.norm(seen), words = this.exitWords(seen);
+    const shown = words && words.filter(x => !VEC[x][2]).sort().join();
+    /* The title must match and, where both are known, so must the exits: a room with other exits is
+       another room, however alike the title. */
+    const c = Object.keys(R).filter(k => k !== cur && Object.values(R[k].exits || {}).includes(cur) &&
+      this.norm(R[k].sig || R[k].name) === t && (!words || !R[k].ex || R[k].ex.slice().sort().join() === shown));
+    return c.length > 1 ? this.nearest(R[cur], c) : c[0] || null;
   },
   move(dir, plain) {
     const r = this.data.rooms;
@@ -870,8 +1051,23 @@ const mapper = {
     const via = from.exits && from.exits[dir];
     if (via && r[via]) return this.land(via, plain);
     const ahead = r[this.rk(from.x + v[0], from.y + v[1], from.z + v[2])], seen = this.lines(plain)[0];
-    if (ahead && this.opts.expand && seen && ahead.sig && this.norm(ahead.sig) !== this.norm(seen) &&
-        !this.data.edges[this.edgeKey(this.data.cur, this.rk(ahead.x, ahead.y, ahead.z))]) this.makeRoom(from, v);
+    /* The room in the next cell is where this leads if it is a link walked before, or looks like the room
+       just shown (same title, and the same exits where both are known). */
+    const fits = !ahead || !seen || this.sameRoom(ahead, seen) ||
+      !!this.data.edges[this.edgeKey(this.data.cur, this.rk(ahead.x, ahead.y, ahead.z))];
+    /* Coming back the way a custom exit (part ferns) went: a mapped room with an exit into this one, and
+       the title and exits now shown, is where this leads, rather than a new room in the next cell. */
+    if (seen && !(ahead && fits)) {
+      const back = this.backRoom(this.data.cur, seen);
+      if (back) { (from.exits || (from.exits = {}))[dir] = back; return this.land(back, plain); }
+    }
+    if (!fits) {
+      /* The map disagrees with the MUD here. A mapped room that looks exactly like this one is likelier
+         than a new one; failing that, make room for it. */
+      const like = this.lookalike(this.data.cur, seen);
+      if (like) { (from.exits || (from.exits = {}))[dir] = like; return this.land(like, plain); }
+      if (this.opts.expand) this.makeRoom(from, v);
+    }
     const to = this.ensureRoom(from.x + v[0], from.y + v[1], from.z + v[2]);
     this.data.edges[this.edgeKey(this.data.cur, to)] = 1;
     this.data.cur = to;
@@ -947,15 +1143,20 @@ const mapper = {
   cancelWalk() { if (this.walk) { clearTimeout(this.walk.timer); this.walk = null; this.exploreSoon(); } },
   /* ---- explorer: visits every listed compass exit, then walks to the nearest room that still has one ---- */
   /* Room lines end with their exits, "Bree Gate(e, nw, n, w and s)". Up and down are not explored. */
+  /* The compass exits at the end of a room line, "Amon Din(e, path and n) [se]"; null if it has none. A
+     non-compass exit such as "path" is allowed alongside them. */
+  exitWords(line) {
+    const m = /\(([^()]*)\)\s*(?:\[[^\]]*\]\s*)*$/.exec(line || "");
+    const words = m && m[1].split(/,|\band\b/).map(w => w.trim().toLowerCase()).filter(Boolean).map(w => LONG[w] || w);
+    return words && words.some(t => VEC[t]) ? words.filter(t => VEC[t]) : null;
+  },
   learnExits(room, seg) {
-    const split = t => t.split(/,|\band\b/).map(w => w.trim().toLowerCase()).filter(Boolean).map(w => LONG[w] || w);
-    const m = /\(([^()]*)\)\s*$/.exec(this.lines(seg)[0] || "");
-    const brief = m && split(m[1]);
-    if (brief && brief.length && brief.every(t => VEC[t])) return void (room.ex = brief.filter(t => !VEC[t][2]));
+    const brief = this.exitWords(this.lines(seg)[0]);
+    if (brief) return void (room.ex = brief.filter(t => !VEC[t][2]));
     /* A full description ends "The only obvious exits are southwest, east and cave." Exits that are not
        compass directions (cave) are left to be mapped as custom exits. */
     const full = /obvious exits? (?:are|is)\s+([^.]*)\./i.exec(seg.replace(/\s+/g, " "));
-    const words = full && split(full[1]).filter(t => VEC[t]);
+    const words = full && full[1].split(/,|\band\b/).map(w => w.trim().toLowerCase()).filter(Boolean).map(w => LONG[w] || w).filter(t => VEC[t]);
     if (words && words.length) room.ex = words.filter(t => !VEC[t][2]);
   },
   /* Exits of room k that have not been tried: no link, custom exit or failed attempt for them yet. */
@@ -1133,7 +1334,7 @@ const mapper = {
     this.selected = k;
     const r = this.data.rooms[k];
     $("selBar").hidden = !r;
-    if (r) $("sel").textContent = `${r.name || "Room"} (${r.x}, ${-r.y}, ${r.z})`;
+    if (r) $("sel").textContent = `${r.name || "Room"} (${r.x}, ${-r.y}, ${r.z})` + (k === this.data.flee ? " · flee room" : "");
     this.render();
   },
 };
@@ -1188,10 +1389,32 @@ $("explore").onclick = () => {
   mapper.startExplore(Math.max(1, +$("exploreMax").value || 200));
   if (!mapper.explore) $("explore").textContent = "Explore";
 };
+$("fleeRoom").onclick = () => {
+  const k = mapper.selected;
+  if (!k || !mapper.data.rooms[k]) return;
+  mapper.data.flee = k; mapper.save(); mapper.select(k);
+};
 $("merge").onclick = () => {
   const k = mapper.selected, d = mapper.data;
   if (!k || !d.rooms[k] || !d.cur || k === d.cur) return alert("Select a different room (shift-click) while standing in the room it should be merged into.");
   if (confirm(`Merge "${d.rooms[k].name || d.rooms[k].sig || "this room"}" into the room you are in? Links to it will lead here instead.`)) mapper.mergeInto(k, d.cur);
+};
+let tidyBackup = null;
+$("tidy").onclick = () => {
+  const d = mapper.data;
+  if (!Object.keys(d.rooms).length) return;
+  if (!confirm("Re-place every room from its links? Rooms stay joined the way they are linked; tangled areas come apart. You can undo it afterwards.")) return;
+  const snap = JSON.stringify({ rooms: d.rooms, edges: d.edges, cur: d.cur, flee: d.flee });
+  if (!mapper.tidy()) return alert("Nothing needed to move.");
+  tidyBackup = snap;
+  $("tidyUndo").hidden = false;
+  mapper.save(); mapper.syncView(); mapper.select(mapper.selected);
+};
+$("tidyUndo").onclick = () => {
+  if (!tidyBackup) return;
+  Object.assign(mapper.data, JSON.parse(tidyBackup));
+  tidyBackup = null; $("tidyUndo").hidden = true;
+  mapper.save(); mapper.syncView(); mapper.select(null);
 };
 $("rename").onclick = () => {
   const r = mapper.data.rooms[mapper.selected];
@@ -1214,6 +1437,7 @@ $("del").onclick = () => {
   for (const e in d.edges) if (e.split("|").includes(k)) delete d.edges[e];
   for (const o in d.rooms) for (const c in d.rooms[o].exits) if (d.rooms[o].exits[c] === k) delete d.rooms[o].exits[c];
   if (d.cur === k) d.cur = null;
+  if (d.flee === k) delete d.flee;
   mapper.save(); mapper.select(null);
 };
 
@@ -1240,7 +1464,7 @@ $("blocked").oninput = e => {
   try { new RegExp(e.target.value); e.target.style.borderColor = ""; mapper.opts.blocked = e.target.value; saveOpts(); }
   catch (err) { e.target.style.borderColor = "var(--bad)"; }
 };
-for (const [id, key] of [["promptRe", "prompt"], ["doEnd", "doEnd"], ["arriveRe", "arrive"], ["travelEnd", "travelEnd"]]) {
+for (const [id, key] of [["promptRe", "prompt"], ["doEnd", "doEnd"], ["arriveRe", "arrive"], ["travelEnd", "travelEnd"], ["fleeRe", "flee"]]) {
   $(id).value = mapper.opts[key];
   $(id).oninput = e => {
     try { new RegExp(e.target.value); e.target.style.borderColor = ""; mapper.opts[key] = e.target.value; saveOpts(); }
@@ -1264,7 +1488,7 @@ $("file").onchange = async e => {
 };
 /* saved maps */
 const cleanName = n => (n || "").trim().replace(/\s+/g, " ");
-$("mapSel").onchange = e => mapper.choose(e.target.value);
+$("mapSel").onchange = e => { tidyBackup = null; $("tidyUndo").hidden = true; mapper.choose(e.target.value); };
 $("mapNew").onclick = () => {
   const name = cleanName(prompt("Name for the new map"));
   if (!name) return;
