@@ -290,7 +290,7 @@ function connect() {
   setStatus("Connecting…");
   ws = new WebSocket(`ws://${location.host}/ws?host=${encodeURIComponent(host)}&port=${encodeURIComponent(port)}`);
   const mine = ws;
-  ws.onopen = () => { connected = true; setStatus(`Connected to ${host}:${port}`, true); $("connect").textContent = "Disconnect"; $("cmd").focus(); };
+  ws.onopen = () => { connected = true; retryStart = 0; setStatus(`Connected to ${host}:${port}`, true); $("connect").textContent = "Disconnect"; $("cmd").focus(); };
   ws.onmessage = e => {
     const m = JSON.parse(e.data);
     if (m.t === "data") { const plain = stripAnsi(m.d); print(m.d); mapper.onData(plain); triggers.feed(plain); }
@@ -300,12 +300,38 @@ function connect() {
   };
   ws.onclose = () => {
     if (ws !== mine) return;
+    const wasConnected = connected;
     connected = false; ws = null;
     setStatus("Disconnected"); $("connect").textContent = "Connect"; $("cmd").type = "text";
     mapper.stopExplore("disconnected"); mapper.cancelWalk(); mapper.reset(); triggers.reset();
+    if (wantConnected) scheduleReconnect(wasConnected ? 0 : 200);
   };
 }
-$("connect").onclick = () => { if (ws) ws.close(); else connect(); };
+
+/* Auto-reconnect: after an unexpected drop, retry straight away, then every 0.2 seconds until it works.
+   Clicking the button while waiting (or Disconnect while connected) cancels it. */
+let wantConnected = false, retryTimer = null, retryStart = 0;
+const RETRY_LIMIT_MS = 30000;
+function scheduleReconnect(delay) {
+  clearTimeout(retryTimer);
+  if (!retryStart) retryStart = Date.now();
+  if (Date.now() - retryStart > RETRY_LIMIT_MS) {
+    stopReconnect();
+    setStatus("Disconnected (gave up reconnecting after 30s)"); $("connect").textContent = "Connect";
+    return;
+  }
+  setStatus("Reconnecting…");
+  $("connect").textContent = "Cancel";
+  retryTimer = setTimeout(() => { retryTimer = null; if (wantConnected && !ws) connect(); }, delay);
+}
+function stopReconnect() {
+  wantConnected = false; clearTimeout(retryTimer); retryTimer = null; retryStart = 0;
+}
+$("connect").onclick = () => {
+  if (ws) { stopReconnect(); ws.close(); }
+  else if (retryTimer || wantConnected) { stopReconnect(); setStatus("Disconnected"); $("connect").textContent = "Connect"; }
+  else { wantConnected = true; connect(); if (!ws) wantConnected = false; }
+};
 
 function sendCommand(raw, echo = true) {
   if (!connected) { print("[Not connected]\n", "sys"); return; }
